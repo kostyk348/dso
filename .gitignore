@@ -1,0 +1,12 @@
+# Compiled artifacts
+dso_runtime
+*.o
+*.so
+
+# Model weights (download separately, see README)
+model/
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
