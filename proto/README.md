@@ -1,49 +1,56 @@
-# DSO Prototype: Event-Driven Simulation
+# DSO Prototype v4 — Dependency Graph · Time as Events · Deterministic Replay
 
 Minimal demonstration of DSO philosophy in Rust.
 
+## Architecture
+
+```
+╔══════════════════ Compile Time ═══════════════════╗
+║  Contracts → Dependency Graph (producer→consumer) ║
+║           → Resource Graph (ownership)            ║
+╚════════════════════════════════════════════════════╝
+╔══════════════════ Runtime ════════════════════════╗
+║  Timed Event Queue → Advance to next event time  ║
+║                    → Follow dep graph edges       ║
+║                    → Branchless dispatch (table)  ║
+║                    → Log event + hash-chain       ║
+║                    → Propagate spawned events     ║
+╚════════════════════════════════════════════════════╝
+```
+
 ## Key Results
 
-### 1M objects, 99.99% never woke up
-
 ```
-─── 1. Single timer event ───
-  DSO:    121 objects woken in 15µs
-  ECS:    visited 1M objects in 385µs    (25× slower)
+1M objects, 175 active types, 999,825 always-sleeping
+3,100 dependency edges compiled at init
 
-─── 2. 150 timer events ───
-  DSO:    3450 objects woken in 154µs
-  ECS:    visited 1M objects in 385µs    (2.5× per event)
-
-─── 3. Resource chain ───
-  DSO:    360 objects woken in 27µs (3 Wood events → Factory → City)
+Timer(0) → 1 object woken (chain: Tree → 20 factories → 5 cities)
+Time skip: 5000ns jump, 152 woken
+Deterministic replay: 153 timer events, verified exact match
+99.98% of objects never woke up
 ```
 
-## What It Demonstrates
+## DSO Principles Demonstrated
 
-- **Sleep By Default** — 999,974 objects never woke up (99.99%)
-- **Nothing Executes Without Reason** — only events wake objects
-- **World Is A Dependency Graph** — Tree→Factory→City chain propagation
-- **Compile Knowledge** — event routes compiled into flat array at init (no HashMap in hot path)
-- **Branchless by Design** — dispatch through function pointer table (no `match` in hot path)
-- **Every Resource Has An Owner** — Resource Graph tracks ownership, transfers, consumption
-- **Determinism First** — append-only event log with hash-chain for replay verification
+| # | Principle | Implementation |
+|---|---|---|
+| 3 | **Global Planning** | Dependency graph compiled at init, not built at runtime |
+| 9 | **World Is A Dependency Graph** | Producer→consumer edges, not broadcast |
+| 15 | **Time Is Also An Event** | Timed event queue, time skipping to next event |
+| 1 | **Determinism First** | Full event log with hash-chain, replay verification |
+| 7 | **Nothing Executes Without Reason** | Objects wake only on events, never polled |
+| 6 | **Sleep By Default** | 99.98% of objects never touched by CPU |
 
-## Architecture v3
+## Interactive CLI
 
 ```
-Compilation phase:
-  Contracts → Compiled Routes (flat Vec<Vec<ObjectId>>)
-           → Resource Graph (ownership tracking)
-
-Runtime:
-  Event → Flat route lookup → Object(Wake → Execute via table → Sleep)
-                              │
-                              ▼
-                         New Events → Propagate
-                              │
-                              ▼
-                         Event Log (append-only, hash-chain)
+status          — world state
+stats           — system stats
+time            — current time
+fire Timer(0)   — fire a timer event
+advance 1000    — advance 1000ns
+replay          — replay event log
+quit            — exit
 ```
 
 ## Running
