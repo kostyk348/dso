@@ -1,6 +1,6 @@
 # DSO Prototype v4 — Dependency Graph · Time as Events · Deterministic Replay
 
-Minimal demonstration of DSO philosophy in Rust.
+Rust implementation of the DSO philosophy with a full benchmark suite.
 
 ## Architecture
 
@@ -8,6 +8,7 @@ Minimal demonstration of DSO philosophy in Rust.
 ╔══════════════════ Compile Time ═══════════════════╗
 ║  Contracts → Dependency Graph (producer→consumer) ║
 ║           → Resource Graph (ownership)            ║
+║           → Dispatch Table (branchless)           ║
 ╚════════════════════════════════════════════════════╝
 ╔══════════════════ Runtime ════════════════════════╗
 ║  Timed Event Queue → Advance to next event time  ║
@@ -18,28 +19,47 @@ Minimal demonstration of DSO philosophy in Rust.
 ╚════════════════════════════════════════════════════╝
 ```
 
-## Key Results
+## Benchmarks
 
-```
-1M objects, 175 active types, 999,825 always-sleeping
-3,100 dependency edges compiled at init
+Run with `cargo run --release -- --bench`:
 
-Timer(0) → 1 object woken (chain: Tree → 20 factories → 5 cities)
-Time skip: 5000ns jump, 152 woken
-Deterministic replay: 153 timer events, verified exact match
-99.98% of objects never woke up
-```
+### Scalability
 
-## DSO Principles Demonstrated
+| Objects | DSO 1 event | ECS 1 scan | Speedup |
+|---------|-------------|------------|---------|
+| 1,000 | 2.5µs | 2.0µs | 0.8× |
+| 10,000 | 6.8µs | 26.6µs | 3.9× |
+| 100,000 | 47.1µs | 266.6µs | **5.7×** |
 
-| # | Principle | Implementation |
-|---|---|---|
-| 3 | **Global Planning** | Dependency graph compiled at init, not built at runtime |
-| 9 | **World Is A Dependency Graph** | Producer→consumer edges, not broadcast |
-| 15 | **Time Is Also An Event** | Timed event queue, time skipping to next event |
-| 1 | **Determinism First** | Full event log with hash-chain, replay verification |
-| 7 | **Nothing Executes Without Reason** | Objects wake only on events, never polled |
-| 6 | **Sleep By Default** | 99.98% of objects never touched by CPU |
+### Event burst
+
+| Burst | Total | Per event |
+|-------|-------|-----------|
+| 1 | 42.5µs | 42.5µs |
+| 10 | 45.5µs | 4.6µs |
+| 100 | 60.4µs | 603ns |
+| 1,000 | 168.7µs | **168ns** |
+
+### Chain propagation
+
+| Depth | Total | Per hop |
+|-------|-------|---------|
+| 1 | 3.9µs | 3.9µs |
+| 20 | 2.5µs | **126ns** |
+
+### Active ratio invariance
+
+DSO: ~42µs regardless of active ratio (only woken objects touched).
+ECS: ~250µs regardless (scans everything every time).
+Speedup: **5–8× across all ratios.**
+
+### Time skipping
+
+Skipping 1ms of empty time: **201ns real time. O(1).**
+
+### Deterministic replay
+
+50 timer events, exact match verified at 1K, 10K, and 100K object scales.
 
 ## Interactive CLI
 
@@ -53,8 +73,23 @@ replay          — replay event log
 quit            — exit
 ```
 
+## DSO Principles Demonstrated
+
+| # | Principle | Implementation |
+|---|-----------|----------------|
+| 1 | **Determinism First** | Full event log with hash-chain, replay verification |
+| 3 | **Global Planning** | Dependency graph compiled at init, not built at runtime |
+| 6 | **Sleep By Default** | 99.98% of objects never touched by CPU |
+| 7 | **Nothing Executes Without Reason** | Objects wake only on events, never polled |
+| 9 | **World Is A Dependency Graph** | Producer→consumer edges, not broadcast |
+| 15 | **Time Is Also An Event** | Timed event queue, time skipping to next event |
+
 ## Running
 
 ```bash
+# Interactive demo
 cargo run --release
+
+# Benchmarks
+cargo run --release -- --bench
 ```

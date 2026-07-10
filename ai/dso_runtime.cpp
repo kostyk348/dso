@@ -74,9 +74,35 @@ static const uint16_t* g_emb = nullptr; // embed_tokens BF16 rows [VOCAB, HIDDEN
 // WT: a tensor in the .dso file. kind 0 = fp32 blob, 1 = int8 blob + per-row fp32 scale.
 struct WT { int kind; const void* data; const float* scale; int N, K; };
 static std::unordered_map<std::string, WT> g_w;
-static int g_mode = 0; // 0 = BF16 safetensors, 1 = INT8 .dso
+static int g_mode = 0; // 0 = BF16 safetensors, 1 = INT8 .dso, 2 = GGUF
 static const int8_t* g_emb_i8 = nullptr;     // embed rows (int8) [VOCAB, HIDDEN]
 static const float* g_emb_scale = nullptr;   // per-row scale [VOCAB]
+
+// ---- GGUF mode ----
+enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8, GGML_BF16 = 30 };
+struct GGUFTensor { uint64_t offset; int type; std::vector<uint64_t> ne; };
+static std::unordered_map<std::string, GGUFTensor> g_gguf_tmap;
+static uint64_t g_gguf_data_start = 0;
+static int g_gguf_alignment = 32;
+// GGUF embedding info (generic: handles any type)
+static const void* g_emb_gguf = nullptr;  // raw embedding tensor data
+static int g_emb_gguf_type = GGML_BF16;   // GGML type
+static size_t g_emb_gguf_row_bytes = 0;   // bytes per embedding row
+
+static inline float fp16_to_f32(uint16_t h) {
+    uint32_t sign = ((uint32_t)(h >> 15)) << 31;
+    uint32_t exp = ((h >> 10) & 0x1f);
+    uint32_t mant = (h & 0x3ff);
+    uint32_t u;
+    if (exp == 0) {
+        u = sign | ((127 - 15) << 23) | (mant << 13);
+    } else if (exp == 31) {
+        u = sign | (0xff << 23) | (mant << 13);
+    } else {
+        u = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float f; memcpy(&f, &u, 4); return f;
+}
 
 // active weight arena (BF16 mode): one FP32 weight matrix at a time (max = down_proj)
 // In INT8 mode weights are read directly as int8 from the mmap (1 byte/param).
@@ -171,6 +197,138 @@ static void parse_header() {
     auto it = g_tmap.find("model.embed_tokens.weight");
     if (it == g_tmap.end()) { fprintf(stderr, "embed_tokens not found\n"); exit(1); }
     g_emb = (const uint16_t*)(g_map + g_data_start + it->second.off);
+}
+
+// ---- GGUF header parser ----
+static uint64_t gguf_read_u64(const char*& p) { uint64_t v; memcpy(&v, p, 8); p += 8; return v; }
+static uint32_t gguf_read_u32(const char*& p) { uint32_t v; memcpy(&v, p, 4); p += 4; return v; }
+static std::string gguf_read_str(const char*& p) { uint64_t len = gguf_read_u64(p); std::string s(p, len); p += len; return s; }
+static void parse_gguf() {
+    const char* p = g_map;
+    uint32_t magic = gguf_read_u32(p);
+    if (magic != 0x46554747) { fprintf(stderr, "bad GGUF magic 0x%x\n", magic); exit(1); }
+    int version = (int)gguf_read_u32(p);
+    uint64_t tensor_cnt = gguf_read_u64(p);
+    uint64_t meta_cnt = gguf_read_u64(p);
+    g_gguf_alignment = 32;
+    for (uint64_t i = 0; i < meta_cnt; i++) {
+        std::string key = gguf_read_str(p);
+        uint32_t vtype = gguf_read_u32(p);
+        auto skip_str = [&]() { uint64_t sl = gguf_read_u64(p); p += sl; };
+        auto skip = [&](int n) { p += n; };
+        bool is_align = (key == "general.alignment");
+        switch (vtype) {
+            case 0: case 1: case 2: case 3: case 8:
+                if (is_align) { g_gguf_alignment = (int)gguf_read_u64(p); } else skip(8);
+                break;
+            case 4: skip(4); break;
+            case 5: skip(1); break;
+            case 6: skip_str(); break;
+            case 7: {
+                gguf_read_u32(p); // arr_type
+                uint64_t arr_len = gguf_read_u64(p);
+                for (uint64_t j = 0; j < arr_len; j++) skip_str();
+                break;
+            }
+            case 9: skip(8); break;
+            case 10: case 11: skip(2); break;
+            default: fprintf(stderr, "unknown GGUF metadata type %u\n", vtype); exit(1);
+        }
+    }
+    for (uint64_t i = 0; i < tensor_cnt; i++) {
+        std::string name = gguf_read_str(p);
+        uint32_t n_dims = gguf_read_u32(p);
+        std::vector<uint64_t> ne(n_dims);
+        for (uint32_t d = 0; d < n_dims; d++) ne[d] = gguf_read_u64(p);
+        uint32_t type = gguf_read_u32(p);
+        uint64_t offset = gguf_read_u64(p);
+        g_gguf_tmap[name] = {offset, (int)type, ne};
+    }
+    size_t total_hdr = (size_t)(p - g_map);
+    size_t ds = (total_hdr + g_gguf_alignment - 1) & ~(size_t)(g_gguf_alignment - 1);
+    g_gguf_data_start = ds;
+    // set up embedding pointer
+    auto emb = g_gguf_tmap.find("model.embed_tokens.weight");
+    if (emb == g_gguf_tmap.end()) { fprintf(stderr, "embed_tokens not found\n"); exit(1); }
+    g_emb_gguf = g_map + ds + emb->second.offset;
+    g_emb_gguf_type = emb->second.type;
+    size_t n_elems = 1; for (auto d : emb->second.ne) n_elems *= d;
+    size_t n_rows = emb->second.ne.size() > 1 ? emb->second.ne[0] : 1;
+    g_emb_gguf_row_bytes = (n_elems / n_rows) * gguf_elem_size(g_emb_gguf_type);
+    if (g_emb_gguf_type == GGML_F32) {
+        g_emb = (const uint16_t*)((const float*)g_emb_gguf); // reuse for F32 (will cast in lm_head)
+    } else if (g_emb_gguf_type == GGML_BF16) {
+        g_emb = (const uint16_t*)g_emb_gguf;
+    }
+    fprintf(stderr, "[gguf] v=%d tensors=%llu alignment=%d embed_type=%d\n",
+            version, (unsigned long long)tensor_cnt, g_gguf_alignment, g_emb_gguf_type);
+}
+static inline int gguf_elem_size(int type) {
+    switch (type) {
+        case GGML_F32: return 4;
+        case GGML_F16: case GGML_BF16: return 2;
+        case GGML_Q8_0: return 1; // per-element after dequant, but 34 bytes per 32 elems
+        default: return 2;
+    }
+}
+static inline size_t gguf_tensor_bytes(const GGUFTensor& t) {
+    size_t n = 1; for (auto d : t.ne) n *= (size_t)d;
+    if (t.type == GGML_Q8_0) return (n / 32) * 34 + (n % 32 ? 34 : 0);
+    return n * (size_t)gguf_elem_size(t.type);
+}
+
+static void load_weight_gguf(const std::string& name, float* dst) {
+    auto it = g_gguf_tmap.find(name);
+    if (it == g_gguf_tmap.end()) { fprintf(stderr, "MISSING GGUF tensor: %s\n", name.c_str()); exit(1); }
+    const char* src = g_map + g_gguf_data_start + it->second.offset;
+    size_t n = 1; for (auto d : it->second.ne) n *= (size_t)d;
+    if (it->second.type == GGML_F32) {
+        memcpy(dst, src, n * 4);
+    } else if (it->second.type == GGML_BF16) {
+        const uint16_t* b = (const uint16_t*)src;
+        #if defined(__x86_64__) || defined(__i386__)
+        size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m128i bf16 = _mm_loadu_si128((const __m128i*)&b[i]);
+            __m256i i32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16), 16);
+            _mm256_storeu_ps(&dst[i], _mm256_castsi256_ps(i32));
+        }
+        for (; i < n; i++) dst[i] = bf16_to_f32(b[i]);
+        #else
+        for (size_t i = 0; i < n; i++) dst[i] = bf16_to_f32(b[i]);
+        #endif
+    } else if (it->second.type == GGML_F16) {
+        const uint16_t* b = (const uint16_t*)src;
+        for (size_t i = 0; i < n; i++) dst[i] = fp16_to_f32(b[i]);
+    } else if (it->second.type == GGML_Q8_0) {
+        int n_blocks = (int)(n + 31) / 32;
+        #pragma omp parallel for
+        for (int b = 0; b < n_blocks; b++) {
+            const uint8_t* blk = (const uint8_t*)src + b * 34;
+            float d = fp16_to_f32(*(const uint16_t*)blk);
+            const int8_t* qs = (const int8_t*)(blk + 2);
+            int rem = (int)n - b * 32;
+            int bn = rem > 32 ? 32 : rem;
+            for (int i = 0; i < bn; i++) dst[b * 32 + i] = d * (float)qs[i];
+        }
+    } else {
+        fprintf(stderr, "unsupported GGUF type %d for %s\n", it->second.type, name.c_str());
+        exit(1);
+    }
+}
+static void load_bias_gguf(const std::string& name, float* dst, int n) {
+    auto it = g_gguf_tmap.find(name);
+    if (it == g_gguf_tmap.end()) { fprintf(stderr, "MISSING GGUF bias: %s\n", name.c_str()); exit(1); }
+    const char* src = g_map + g_gguf_data_start + it->second.offset;
+    if (it->second.type == GGML_F32) {
+        memcpy(dst, src, (size_t)n * 4);
+    } else if (it->second.type == GGML_BF16) {
+        const uint16_t* b = (const uint16_t*)src;
+        for (int i = 0; i < n; i++) dst[i] = bf16_to_f32(b[i]);
+    } else {
+        fprintf(stderr, "unsupported bias type %d\n", it->second.type);
+        exit(1);
+    }
 }
 
 static void load_weight(const std::string& name, float* dst) {
@@ -307,6 +465,7 @@ __attribute__((target("avx2")))
 static void linear_i8_avx2(const float* X, int M, int K, const int8_t* W, const float* S, int N, float* Y, int nt); // fwd decl
 static const float* norm_weight(const std::string& name) {
     if (g_mode == 0) { load_weight(name, weight_buf); return weight_buf; }
+    if (g_mode == 2) { load_weight_gguf(name, weight_buf); return weight_buf; }
     auto it = g_w.find(name);
     if (it == g_w.end()) { fprintf(stderr, "MISSING %s\n", name.c_str()); exit(1); }
     return (const float*)it->second.data;
@@ -319,6 +478,17 @@ static void proj(const std::string& wname, const float* X, int M, int K, int N, 
         if (!bname.empty()) {
             auto sh = g_tmap[bname].shape; int n = 1; for (int s : sh) n *= s;
             load_bias(bname, bias_buf, n);
+            for (int i = 0; i < M; i++)
+                for (int j = 0; j < N; j++)
+                    Y[(size_t)i * N + j] += bias_buf[j];
+        }
+    } else if (g_mode == 2) {
+        load_weight_gguf(wname, weight_buf);
+        linear(X, M, K, weight_buf, N, Y, nt);
+        if (!bname.empty()) {
+            auto& t = g_gguf_tmap[bname];
+            int n = 1; for (auto d : t.ne) n *= (int)d;
+            load_bias_gguf(bname, bias_buf, n);
             for (int i = 0; i < M; i++)
                 for (int j = 0; j < N; j++)
                     Y[(size_t)i * N + j] += bias_buf[j];
@@ -348,6 +518,11 @@ static void madvise_tensor(const std::string& name, int advice) {
         size_t nbytes = 2; // BF16
         for (int s : it->second.shape) nbytes *= (size_t)s;
         madvise(g_map + g_data_start + it->second.off, nbytes, advice);
+    } else if (g_mode == 2) {
+        auto it = g_gguf_tmap.find(name);
+        if (it == g_gguf_tmap.end()) return;
+        size_t nbytes = gguf_tensor_bytes(it->second);
+        madvise((void*)(g_map + g_gguf_data_start + it->second.offset), nbytes, advice);
     } else {
         auto it = g_w.find(name);
         if (it == g_w.end()) return;
@@ -638,6 +813,37 @@ static inline float dot_xn_i8_avx2(const float* xn, const int8_t* r, int n) {
         __m256 vf = _mm256_cvtepi32_ps(vi8);
         __m256 vx = _mm256_loadu_ps(xn + k);
         acc = _mm256_add_ps(acc, _mm256_mul_ps(vx, vf));
+    }
+    return hsum256(acc);
+}
+
+// Q8_0 dot product for GGUF lm_head: row points to Q8_0 blocks, n = HIDDEN
+__attribute__((target("avx2")))
+static inline float dot_xn_q8_avx2(const float* xn, const void* row, int n) {
+    const uint8_t* blk = (const uint8_t*)row;
+    __m256 acc = _mm256_setzero_ps();
+    for (int k = 0; k < n; k += 32) {
+        float d = fp16_to_f32(*(const uint16_t*)blk);
+        __m256 vd = _mm256_set1_ps(d);
+        const int8_t* qs = (const int8_t*)(blk + 2);
+        for (int t = 0; t < 32; t += 8) {
+            __m256i vi8 = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)&qs[t]));
+            __m256 vf = _mm256_mul_ps(_mm256_cvtepi32_ps(vi8), vd);
+            __m256 vx = _mm256_loadu_ps(xn + k + t);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(vx, vf));
+        }
+        blk += 34;
+    }
+    return hsum256(acc);
+}
+// F32 dot product for GGUF lm_head
+__attribute__((target("avx2")))
+static inline float dot_xn_f32_avx2(const float* xn, const float* row, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int k = 0; k < n; k += 8) {
+        __m256 vx = _mm256_loadu_ps(xn + k);
+        __m256 vw = _mm256_loadu_ps(row + k);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(vx, vw));
     }
     return hsum256(acc);
 }
