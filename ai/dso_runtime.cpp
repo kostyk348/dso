@@ -98,6 +98,20 @@ static float gate_buf[INTER];
 static float up_buf[INTER];
 static float act_buf[INTER];
 static float logits[VOCAB];
+static int g_spec_logits[VOCAB]; // scratch for draft verification at each block position
+
+// ---- block-forward buffers (self-speculative verification, M_MAX = 16) ----
+static const int M_MAX = 16;
+static float x_block[M_MAX * HIDDEN];
+static float xn_block_b[M_MAX * HIDDEN];
+static float q_block_b[M_MAX * HIDDEN];
+static float k_block_b[M_MAX * N_KV * HEAD_DIM];
+static float v_block_b[M_MAX * N_KV * HEAD_DIM];
+static float gate_block_b[M_MAX * INTER];
+static float up_block_b[M_MAX * INTER];
+static float act_block_b[M_MAX * INTER];
+static float ffn_block_b[M_MAX * HIDDEN];
+
 // KV-cache: per layer, [MAX_SEQ][N_KV][HEAD_DIM]
 static float* g_kcache; // [N_LAYERS*MAX_SEQ*N_KV*HEAD_DIM]
 static float* g_vcache;
@@ -285,7 +299,9 @@ static void proj(const std::string& wname, const float* X, int M, int K, int N, 
         if (!bname.empty()) {
             auto sh = g_tmap[bname].shape; int n = 1; for (int s : sh) n *= s;
             load_bias(bname, bias_buf, n);
-            for (int i = 0; i < N; i++) Y[i] += bias_buf[i];
+            for (int i = 0; i < M; i++)
+                for (int j = 0; j < N; j++)
+                    Y[(size_t)i * N + j] += bias_buf[j];
         }
     } else {
         WT& w = g_w[wname];
@@ -297,7 +313,9 @@ static void proj(const std::string& wname, const float* X, int M, int K, int N, 
         if (!bname.empty()) {
             WT& b = g_w[bname];
             const float* bp = (const float*)b.data;
-            for (int i = 0; i < N; i++) Y[i] += bp[i];
+            for (int i = 0; i < M; i++)
+                for (int j = 0; j < N; j++)
+                    Y[(size_t)i * N + j] += bp[j];
         }
     }
 }
@@ -379,53 +397,170 @@ static void linear(const float* X, int M, int K, const float* W, int N, float* Y
     }
 }
 
+// ---- branchless AVX2 primitives ----
+#if defined(__x86_64__) || defined(__i386__)
+
+// horizontal sum of 8 floats
+static inline float hsum256(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+// horizontal max of 8 floats
+static inline float hmax256(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 m = _mm_max_ps(lo, hi);
+    m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(2,3,0,1)));
+    m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(1,0,3,2)));
+    return _mm_cvtss_f32(m);
+}
+
+#endif
+
 // ---- AVX2 INT8 GEMM: X (float) @ Wq (int8)^T, per-row dynamic activation quant ----
 // Y[i,j] = sx_i * S[j] * sum_k qx_i[k] * Wq[j,k],  qx = round(X / sx), sx = maxabs(X)/127
+// K must be a multiple of 16 (both HIDDEN=896 and INTER=4864 satisfy this).
 #if defined(__x86_64__) || defined(__i386__)
 __attribute__((target("avx2")))
 static void linear_i8_avx2(const float* X, int M, int K, const int8_t* W, const float* S, int N, float* Y, int nt) {
-    int K16 = K - (K % 16);
     for (int i = 0; i < M; i++) {
         const float* xi = X + (size_t)i * K;
-        float mx = 0.0f;
-        for (int k = 0; k < K; k++) { float a = fabsf(xi[k]); if (a > mx) mx = a; }
+        // 1. Compute scale: mx = max(abs(xi)) / 127
+        __m256 vmax = _mm256_setzero_ps();
+        for (int k = 0; k < K; k += 8) {
+            __m256 vx = _mm256_loadu_ps(xi + k);
+            __m256 va = _mm256_max_ps(vx, _mm256_sub_ps(_mm256_setzero_ps(), vx));
+            vmax = _mm256_max_ps(vmax, va);
+        }
+        float mx = hmax256(vmax);
         float sx = (mx > 0.0f) ? mx / 127.0f : 1.0f;
         float inv_sx = 1.0f / sx;
-        for (int k = 0; k < K; k++) {
-            int v = (int)lrintf(xi[k] * inv_sx);
-            v = v < -127 ? -127 : (v > 127 ? 127 : v);
-            g_qx[k] = (int8_t)v;
+        // 2. Quantize: g_qx[k] = clamp(round(xi[k] * inv_sx), -127, 127)
+        // Process 4 floats at a time -> 4 int8 using SSE (avoids lane-crossing pack issues)
+        __m128 vsx128 = _mm_set1_ps(inv_sx);
+        __m128i v127_128 = _mm_set1_epi32(127);
+        __m128i vm127_128 = _mm_set1_epi32(-127);
+        for (int k = 0; k < K; k += 4) {
+            __m128 v = _mm_round_ps(_mm_mul_ps(_mm_loadu_ps(xi + k), vsx128),
+                                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m128i i32 = _mm_cvtps_epi32(v);
+            i32 = _mm_min_epi32(v127_128, _mm_max_epi32(vm127_128, i32));
+            __m128i i16 = _mm_packs_epi32(i32, _mm_setzero_si128());
+            __m128i i8 = _mm_packs_epi16(i16, _mm_setzero_si128());
+            *(int32_t*)(g_qx + k) = _mm_cvtsi128_si32(i8);
         }
+        // 3. GEMM: Y[j] = sx * S[j] * sum_k g_qx[k] * W[j,k]
         float* yi = Y + (size_t)i * N;
         #pragma omp parallel for schedule(static) num_threads(nt)
         for (int j = 0; j < N; j++) {
             const int8_t* wj = W + (size_t)j * K;
             __m256i acc = _mm256_setzero_si256();
             int k = 0;
-            for (; k < K16; k += 16) {
+            for (; k < K; k += 16) {
                 __m256i a = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)&g_qx[k]));
                 __m256i b = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)&wj[k]));
                 acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a, b));
             }
             int32_t s32 = 0;
             for (int t = 0; t < 8; t++) s32 += _mm256_extract_epi32(acc, t);
-            for (; k < K; k++) s32 += (int32_t)g_qx[k] * (int32_t)wj[k];
             yi[j] = sx * S[j] * (float)s32;
         }
     }
 }
 #endif
 
+// AVX2 forward declarations (used by rmsnorm, silu, add before their definitions)
+#if defined(__x86_64__) || defined(__i386__)
+static void rmsnorm_avx2(float* o, const float* x, const float* w, int n);
+static void silu_mul_avx2(float* act, const float* gate, const float* up, int n);
+static void add_avx2(float* a, const float* b, int n);
+#endif
+
 static void rmsnorm(float* o, const float* x, const float* w, int n) {
+#if defined(__x86_64__) || defined(__i386__)
+    rmsnorm_avx2(o, x, w, n);
+#else
     float ss = 0.0f;
     #pragma omp parallel for reduction(+:ss)
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
     float r = 1.0f / sqrtf(ss / n + EPS);
     #pragma omp parallel for
     for (int i = 0; i < n; i++) o[i] = x[i] * r * w[i];
+#endif
 }
 
 static inline float silu(float z) { return z / (1.0f + expf(-z)); }
+
+// ---- branchless AVX2 primitives (continued) ----
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2")))
+static void rmsnorm_avx2(float* o, const float* x, const float* w, int n) {
+    __m256 vss = _mm256_setzero_ps();
+    for (int i = 0; i < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        vss = _mm256_add_ps(vss, _mm256_mul_ps(vx, vx));
+    }
+    float ss = hsum256(vss);
+    float r = 1.0f / sqrtf(ss / (float)n + EPS);
+    __m256 vr = _mm256_set1_ps(r);
+    for (int i = 0; i < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vw = _mm256_loadu_ps(w + i);
+        _mm256_storeu_ps(o + i, _mm256_mul_ps(_mm256_mul_ps(vx, vr), vw));
+    }
+}
+
+// fast approximate exp for AVX2 (relative error ~1e-4 over [-10, 10])
+// based on: exp(x) ≈ 2^(x * log2(e)) with bit manipulation
+__attribute__((target("avx2")))
+static __m256 expf256_approx(__m256 x) {
+    __m256 ln2 = _mm256_set1_ps(0.69314718056f);
+    __m256 k = _mm256_mul_ps(x, _mm256_set1_ps(1.44269504089f)); // x / ln2
+    k = _mm256_round_ps(k, _MM_FROUND_TO_NEAREST_INT);
+    __m256 t = _mm256_sub_ps(x, _mm256_mul_ps(k, ln2));
+    // p(t) = 1 + t + t^2/2 + t^3/6 + t^4/24 + t^5/120
+    __m256 p = _mm256_set1_ps(1.0f);
+    p = _mm256_add_ps(p, _mm256_mul_ps(t, _mm256_set1_ps(1.0f)));
+    __m256 t2 = _mm256_mul_ps(t, t);
+    p = _mm256_add_ps(p, _mm256_mul_ps(t2, _mm256_set1_ps(0.5f)));
+    __m256 t3 = _mm256_mul_ps(t2, t);
+    p = _mm256_add_ps(p, _mm256_mul_ps(t3, _mm256_set1_ps(1.0f/6.0f)));
+    __m256 t4 = _mm256_mul_ps(t2, t2);
+    p = _mm256_add_ps(p, _mm256_mul_ps(t4, _mm256_set1_ps(1.0f/24.0f)));
+    __m256 t5 = _mm256_mul_ps(t4, t);
+    p = _mm256_add_ps(p, _mm256_mul_ps(t5, _mm256_set1_ps(1.0f/120.0f)));
+    // 2^k via reinterpret
+    __m256i ki = _mm256_cvtps_epi32(k);
+    __m256i expo = _mm256_slli_epi32(_mm256_add_epi32(ki, _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(p, _mm256_castsi256_ps(expo));
+}
+
+__attribute__((target("avx2")))
+static void silu_mul_avx2(float* act, const float* gate, const float* up, int n) {
+    __m256 one = _mm256_set1_ps(1.0f);
+    for (int i = 0; i < n; i += 8) {
+        __m256 vg = _mm256_loadu_ps(gate + i);
+        __m256 vu = _mm256_loadu_ps(up + i);
+        __m256 neg = _mm256_sub_ps(_mm256_setzero_ps(), vg);
+        __m256 ve = expf256_approx(neg);
+        __m256 vs = _mm256_div_ps(vg, _mm256_add_ps(one, ve));
+        _mm256_storeu_ps(act + i, _mm256_mul_ps(vs, vu));
+    }
+}
+
+__attribute__((target("avx2")))
+static void add_avx2(float* a, const float* b, int n) {
+    for (int i = 0; i < n; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        _mm256_storeu_ps(a + i, _mm256_add_ps(va, vb));
+    }
+}
+#endif
 
 static void rope(float* vec, int n_heads, int pos) {
     for (int h = 0; h < n_heads; h++) {
@@ -441,8 +576,10 @@ static void rope(float* vec, int n_heads, int pos) {
     }
 }
 
-// forward one token at position `pos`; updates x_buf in place and appends KV.
-static void forward_token(int token, int pos, int nt) {
+// forward one token at position `pos` through `max_layers` layers.
+// After the last layer, always does final norm + lm_head (into logits).
+// If max_layers < N_LAYERS, this is a draft forward (early exit).
+static void forward_token_(int token, int pos, int nt, int max_layers) {
     // embed
     if (g_mode == 0) {
         const uint16_t* row = g_emb + (size_t)token * HIDDEN;
@@ -453,7 +590,7 @@ static void forward_token(int token, int pos, int nt) {
         for (int i = 0; i < HIDDEN; i++) x_buf[i] = sv * (float)row[i];
     }
 
-    for (int L = 0; L < N_LAYERS; L++) {
+    for (int L = 0; L < max_layers; L++) {
         // async: while we compute layer L, the worker prefetches layer L+1
         request_prefetch(L + 1);
         // --- self-attention ---
@@ -505,7 +642,11 @@ static void forward_token(int token, int pos, int nt) {
         }
         proj("model.layers." + std::to_string(L) + ".self_attn.o_proj.weight",
              ctx_buf, 1, HIDDEN, HIDDEN, attn_out, nt);
+#if defined(__x86_64__) || defined(__i386__)
+        add_avx2(x_buf, attn_out, HIDDEN);
+#else
         for (int i = 0; i < HIDDEN; i++) x_buf[i] += attn_out[i];
+#endif
 
         // --- mlp ---
         rmsnorm(xn_buf, x_buf, norm_weight("model.layers." + std::to_string(L) + ".post_attention_layernorm.weight"), HIDDEN);
@@ -513,10 +654,18 @@ static void forward_token(int token, int pos, int nt) {
              xn_buf, 1, HIDDEN, INTER, gate_buf, nt);
         proj("model.layers." + std::to_string(L) + ".mlp.up_proj.weight",
              xn_buf, 1, HIDDEN, INTER, up_buf, nt);
+#if defined(__x86_64__) || defined(__i386__)
+        silu_mul_avx2(act_buf, gate_buf, up_buf, INTER);
+#else
         for (int i = 0; i < INTER; i++) act_buf[i] = silu(gate_buf[i]) * up_buf[i];
+#endif
         proj("model.layers." + std::to_string(L) + ".mlp.down_proj.weight",
              act_buf, 1, INTER, HIDDEN, ffn_out, nt);
+#if defined(__x86_64__) || defined(__i386__)
+        add_avx2(x_buf, ffn_out, HIDDEN);
+#else
         for (int i = 0; i < HIDDEN; i++) x_buf[i] += ffn_out[i];
+#endif
 
         // async: release this layer's pages from the OS page-cache (sliding window)
         layer_madvise(L, MADV_DONTNEED);
@@ -544,6 +693,202 @@ static void forward_token(int token, int pos, int nt) {
                 float s = 0.0f;
                 for (int k = 0; k < HIDDEN; k++) s += xn_buf[k] * (float)r[k];
                 logits[v0 + j] = sv * s;
+            }
+        }
+    }
+}
+
+static void forward_token(int token, int pos, int nt) {
+    forward_token_(token, pos, nt, N_LAYERS);
+}
+
+// ---- forward_block: batched M-token forward through all N layers ----
+// tokens[M] — input token IDs, one per position
+// pos — absolute start position
+// After completion, logits contains predictions for the LAST token (pos+M-1).
+// KV cache is updated for all N layers at positions pos..pos+M-1.
+static void forward_block(const int* tokens, int M, int pos, int nt) {
+    // embed all M tokens into x_block
+    for (int i = 0; i < M; i++) {
+        int tok = tokens[i];
+        float* xi = x_block + (size_t)i * HIDDEN;
+        if (g_mode == 0) {
+            const uint16_t* row = g_emb + (size_t)tok * HIDDEN;
+            for (int j = 0; j < HIDDEN; j++) xi[j] = bf16_to_f32(row[j]);
+        } else {
+            const int8_t* row = g_emb_i8 + (size_t)tok * HIDDEN;
+            float sv = g_emb_scale[tok];
+            for (int j = 0; j < HIDDEN; j++) xi[j] = sv * (float)row[j];
+        }
+    }
+
+    for (int L = 0; L < N_LAYERS; L++) {
+        request_prefetch(L + 1);
+
+        // batch RMSNorm
+        const float* nw = norm_weight(std::string("model.layers." + std::to_string(L) + ".input_layernorm.weight"));
+        #pragma omp parallel for num_threads(nt)
+        for (int i = 0; i < M; i++) {
+            rmsnorm(xn_block_b + (size_t)i * HIDDEN, x_block + (size_t)i * HIDDEN, nw, HIDDEN);
+        }
+
+        // batch QKV projections
+        proj("model.layers." + std::to_string(L) + ".self_attn.q_proj.weight",
+             xn_block_b, M, HIDDEN, N_HEADS * HEAD_DIM, q_block_b, nt,
+             "model.layers." + std::to_string(L) + ".self_attn.q_proj.bias");
+        proj("model.layers." + std::to_string(L) + ".self_attn.k_proj.weight",
+             xn_block_b, M, HIDDEN, N_KV * HEAD_DIM, k_block_b, nt,
+             "model.layers." + std::to_string(L) + ".self_attn.k_proj.bias");
+        proj("model.layers." + std::to_string(L) + ".self_attn.v_proj.weight",
+             xn_block_b, M, HIDDEN, N_KV * HEAD_DIM, v_block_b, nt,
+             "model.layers." + std::to_string(L) + ".self_attn.v_proj.bias");
+
+        // load O_proj weights once
+        const std::string o_name = "model.layers." + std::to_string(L) + ".self_attn.o_proj.weight";
+        float* o_w = nullptr;
+        const WT* o_wt = nullptr;
+        if (g_mode == 0) { load_weight(o_name, weight_buf); o_w = weight_buf; }
+        else o_wt = &g_w[o_name];
+
+        // per-token: RoPE, KV store, attention, O_proj, residual
+        for (int i = 0; i < M; i++) {
+            float* qi = q_block_b + (size_t)i * HIDDEN;
+            float* ki = k_block_b + (size_t)i * N_KV * HEAD_DIM;
+            float* vi = v_block_b + (size_t)i * N_KV * HEAD_DIM;
+            int p = pos + i;
+
+            rope(qi, N_HEADS, p);
+            rope(ki, N_KV, p);
+
+            float* kc = g_kcache + ((size_t)L * MAX_SEQ + p) * N_KV * HEAD_DIM;
+            float* vc = g_vcache + ((size_t)L * MAX_SEQ + p) * N_KV * HEAD_DIM;
+            memcpy(kc, ki, (size_t)N_KV * HEAD_DIM * sizeof(float));
+            memcpy(vc, vi, (size_t)N_KV * HEAD_DIM * sizeof(float));
+
+            // causal attention over 0..p
+            float scale = 1.0f / sqrtf((float)HEAD_DIM);
+            for (int h = 0; h < N_HEADS; h++) {
+                int g = h / N_GROUPS;
+                float* qh = qi + h * HEAD_DIM;
+                float* kc_g = g_kcache + ((size_t)L * MAX_SEQ) * N_KV * HEAD_DIM + (size_t)g * HEAD_DIM;
+                float* vc_g = g_vcache + ((size_t)L * MAX_SEQ) * N_KV * HEAD_DIM + (size_t)g * HEAD_DIM;
+                float maxs = -1e30f;
+                for (int pp = 0; pp <= p; pp++) {
+                    const float* kp = kc_g + (size_t)pp * N_KV * HEAD_DIM;
+                    float s = 0.0f;
+                    for (int d = 0; d < HEAD_DIM; d++) s += qh[d] * kp[d];
+                    s *= scale;
+                    scores[pp] = s;
+                    if (s > maxs) maxs = s;
+                }
+                float sum = 0.0f;
+                for (int pp = 0; pp <= p; pp++) { scores[pp] = expf(scores[pp] - maxs); sum += scores[pp]; }
+                float inv = 1.0f / sum;
+                float* ch = ctx_buf + h * HEAD_DIM;
+                for (int d = 0; d < HEAD_DIM; d++) ch[d] = 0.0f;
+                for (int pp = 0; pp <= p; pp++) {
+                    const float* vp = vc_g + (size_t)pp * N_KV * HEAD_DIM;
+                    float w = scores[pp] * inv;
+                    for (int d = 0; d < HEAD_DIM; d++) ch[d] += w * vp[d];
+                }
+            }
+
+            // O_proj (weights already loaded)
+            if (g_mode == 0) linear(ctx_buf, 1, HIDDEN, o_w, HIDDEN, attn_out, nt);
+            else linear_i8_avx2(ctx_buf, 1, HIDDEN, (const int8_t*)o_wt->data, o_wt->scale, HIDDEN, attn_out, nt);
+
+#if defined(__x86_64__) || defined(__i386__)
+            add_avx2(x_block + (size_t)i * HIDDEN, attn_out, HIDDEN);
+#else
+            for (int d = 0; d < HIDDEN; d++) x_block[(size_t)i * HIDDEN + d] += attn_out[d];
+#endif
+        }
+
+        // post-attention norm + MLP (batched)
+        const float* pnw = norm_weight(std::string("model.layers." + std::to_string(L) + ".post_attention_layernorm.weight"));
+        #pragma omp parallel for num_threads(nt)
+        for (int i = 0; i < M; i++) {
+            rmsnorm(xn_block_b + (size_t)i * HIDDEN, x_block + (size_t)i * HIDDEN, pnw, HIDDEN);
+        }
+
+        proj("model.layers." + std::to_string(L) + ".mlp.gate_proj.weight",
+             xn_block_b, M, HIDDEN, INTER, gate_block_b, nt);
+        proj("model.layers." + std::to_string(L) + ".mlp.up_proj.weight",
+             xn_block_b, M, HIDDEN, INTER, up_block_b, nt);
+
+#if defined(__x86_64__) || defined(__i386__)
+        silu_mul_avx2(act_block_b, gate_block_b, up_block_b, M * INTER);
+#else
+        #pragma omp parallel for num_threads(nt)
+        for (int i = 0; i < M * INTER; i++) {
+            float g = gate_block_b[i];
+            act_block_b[i] = (g / (1.0f + expf(-g))) * up_block_b[i];
+        }
+#endif
+
+        proj("model.layers." + std::to_string(L) + ".mlp.down_proj.weight",
+             act_block_b, M, INTER, HIDDEN, ffn_block_b, nt);
+
+        for (int i = 0; i < M; i++) {
+#if defined(__x86_64__) || defined(__i386__)
+            add_avx2(x_block + (size_t)i * HIDDEN, ffn_block_b + (size_t)i * HIDDEN, HIDDEN);
+#else
+            float* xi = x_block + (size_t)i * HIDDEN;
+            float* fi = ffn_block_b + (size_t)i * HIDDEN;
+            for (int d = 0; d < HIDDEN; d++) xi[d] += fi[d];
+#endif
+        }
+
+        layer_madvise(L, MADV_DONTNEED);
+    }
+
+    // final norm for LAST token only (next-token prediction)
+    rmsnorm(xn_buf, x_block + (size_t)(M - 1) * HIDDEN, norm_weight("model.norm.weight"), HIDDEN);
+
+    // lm_head for last position
+    const int BLOCK = 4096;
+    #pragma omp parallel for schedule(dynamic) num_threads(nt)
+    for (int v0 = 0; v0 < VOCAB; v0 += BLOCK) {
+        int b = (v0 + BLOCK > VOCAB) ? (VOCAB - v0) : BLOCK;
+        if (g_mode == 0) {
+            for (int j = 0; j < b; j++) {
+                const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
+                float s = 0.0f;
+                for (int k = 0; k < HIDDEN; k++) s += xn_buf[k] * bf16_to_f32(r[k]);
+                logits[v0 + j] = s;
+            }
+        } else {
+            for (int j = 0; j < b; j++) {
+                const int8_t* r = g_emb_i8 + (size_t)(v0 + j) * HIDDEN;
+                float sv = g_emb_scale[v0 + j];
+                float s = 0.0f;
+                for (int k = 0; k < HIDDEN; k++) s += xn_buf[k] * (float)r[k];
+                logits[v0 + j] = sv * s;
+            }
+        }
+    }
+}
+
+// ---- lm_head for a single normalized state ----
+static void lm_head(const float* xn, float* out, int nt) {
+    const int BLOCK = 4096;
+    #pragma omp parallel for schedule(dynamic) num_threads(nt)
+    for (int v0 = 0; v0 < VOCAB; v0 += BLOCK) {
+        int b = (v0 + BLOCK > VOCAB) ? (VOCAB - v0) : BLOCK;
+        if (g_mode == 0) {
+            for (int j = 0; j < b; j++) {
+                const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
+                float s = 0.0f;
+                for (int k = 0; k < HIDDEN; k++) s += xn[k] * bf16_to_f32(r[k]);
+                out[v0 + j] = s;
+            }
+        } else {
+            for (int j = 0; j < b; j++) {
+                const int8_t* r = g_emb_i8 + (size_t)(v0 + j) * HIDDEN;
+                float sv = g_emb_scale[v0 + j];
+                float s = 0.0f;
+                for (int k = 0; k < HIDDEN; k++) s += xn[k] * (float)r[k];
+                out[v0 + j] = sv * s;
             }
         }
     }
@@ -618,7 +963,7 @@ int main(int argc, char** argv) {
         pos++;
         next = argmax(logits, VOCAB);
         out.push_back(next);
-        if (next == 151645 && !getenv("DSO_NOEOS")) break; // eos_token_id (unless benchmarking)
+        if (next == 151645 && !getenv("DSO_NOEOS")) break; // eos_token_id
     }
 
     // stop async worker

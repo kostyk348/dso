@@ -1,0 +1,7 @@
+[package]
+name = "dso_proto"
+version = "0.1.0"
+edition = "2024"
+description = "DSO prototype: event-driven simulation with branchless dispatch"
+repository = "https://github.com/kostyk348/dso"
+license = "MIT"
