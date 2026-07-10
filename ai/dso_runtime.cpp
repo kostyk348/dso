@@ -203,6 +203,10 @@ static void parse_header() {
 static uint64_t gguf_read_u64(const char*& p) { uint64_t v; memcpy(&v, p, 8); p += 8; return v; }
 static uint32_t gguf_read_u32(const char*& p) { uint32_t v; memcpy(&v, p, 4); p += 4; return v; }
 static std::string gguf_read_str(const char*& p) { uint64_t len = gguf_read_u64(p); std::string s(p, len); p += len; return s; }
+static inline int gguf_elem_size(int type);
+static inline size_t gguf_row_nbytes(int type, size_t row_elems);
+static inline size_t gguf_tensor_bytes(const GGUFTensor& t);
+static std::string gguf_resolve_name(const std::string& hf);
 static void parse_gguf() {
     const char* p = g_map;
     uint32_t magic = gguf_read_u32(p);
@@ -243,25 +247,40 @@ static void parse_gguf() {
         uint32_t type = gguf_read_u32(p);
         uint64_t offset = gguf_read_u64(p);
         g_gguf_tmap[name] = {offset, (int)type, ne};
+        // GGUF v3+: each tensor-info entry is padded so the file position stays
+        // 32-byte aligned (GGUF_TYPE_SIZE).
+        if (version >= 3) {
+            size_t pos = (size_t)(p - g_map);
+            size_t pad = (32 - (pos % 32)) % 32;
+            p += pad;
+        }
     }
     size_t total_hdr = (size_t)(p - g_map);
     size_t ds = (total_hdr + g_gguf_alignment - 1) & ~(size_t)(g_gguf_alignment - 1);
     g_gguf_data_start = ds;
-    // set up embedding pointer
-    auto emb = g_gguf_tmap.find("model.embed_tokens.weight");
-    if (emb == g_gguf_tmap.end()) { fprintf(stderr, "embed_tokens not found\n"); exit(1); }
+    // set up embedding pointer (try HF then llama.cpp naming)
+    std::string emb_name = gguf_resolve_name("model.embed_tokens.weight");
+    if (emb_name.empty()) { fprintf(stderr, "embed_tokens not found\n"); exit(1); }
+    auto emb = g_gguf_tmap.find(emb_name);
     g_emb_gguf = g_map + ds + emb->second.offset;
     g_emb_gguf_type = emb->second.type;
     size_t n_elems = 1; for (auto d : emb->second.ne) n_elems *= d;
     size_t n_rows = emb->second.ne.size() > 1 ? emb->second.ne[0] : 1;
-    g_emb_gguf_row_bytes = (n_elems / n_rows) * gguf_elem_size(g_emb_gguf_type);
+    g_emb_gguf_row_bytes = gguf_row_nbytes(g_emb_gguf_type, n_elems / n_rows);
     if (g_emb_gguf_type == GGML_F32) {
         g_emb = (const uint16_t*)((const float*)g_emb_gguf); // reuse for F32 (will cast in lm_head)
     } else if (g_emb_gguf_type == GGML_BF16) {
         g_emb = (const uint16_t*)g_emb_gguf;
     }
-    fprintf(stderr, "[gguf] v=%d tensors=%llu alignment=%d embed_type=%d\n",
-            version, (unsigned long long)tensor_cnt, g_gguf_alignment, g_emb_gguf_type);
+    if (getenv("GGUF_DEBUG")) {
+        for (auto& kv : g_gguf_tmap) {
+            fprintf(stderr, "  [gguf] tensor '%s' type=%d shape=[", kv.first.c_str(), kv.second.type);
+            for (size_t i = 0; i < kv.second.ne.size(); i++) fprintf(stderr, "%s%llu", i?"x":"", (unsigned long long)kv.second.ne[i]);
+            fprintf(stderr, "]\n");
+        }
+    }
+    fprintf(stderr, "[gguf] v=%d tensors=%llu alignment=%d embed='%s' type=%d\n",
+            version, (unsigned long long)tensor_cnt, g_gguf_alignment, emb_name.c_str(), g_emb_gguf_type);
 }
 static inline int gguf_elem_size(int type) {
     switch (type) {
@@ -271,15 +290,61 @@ static inline int gguf_elem_size(int type) {
         default: return 2;
     }
 }
+static inline size_t gguf_row_nbytes(int type, size_t row_elems) {
+    if (type == GGML_Q8_0) {
+        size_t n_blocks = (row_elems + 31) / 32;
+        return n_blocks * 34; // 2-byte fp16 scale + 32 int8 = 34 bytes per block
+    }
+    return row_elems * (size_t)gguf_elem_size(type);
+}
 static inline size_t gguf_tensor_bytes(const GGUFTensor& t) {
     size_t n = 1; for (auto d : t.ne) n *= (size_t)d;
     if (t.type == GGML_Q8_0) return (n / 32) * 34 + (n % 32 ? 34 : 0);
     return n * (size_t)gguf_elem_size(t.type);
 }
 
+// Resolve an HF-style tensor name to an actual GGUF tensor name.
+// Handles both HF naming (model.layers.N.self_attn.q_proj.weight) and
+// llama.cpp GGUF naming (blk.N.attn_q.weight), plus embed/norm/output.
+static std::string gguf_resolve_name(const std::string& hf) {
+    if (g_gguf_tmap.count(hf)) return hf;
+    auto try_cands = [](std::initializer_list<const char*> cands) -> std::string {
+        for (auto c : cands) if (g_gguf_tmap.count(c)) return c;
+        return "";
+    };
+    if (hf == "model.embed_tokens.weight")
+        return try_cands({"token_embd.weight", "model.embed_tokens.weight"});
+    if (hf == "model.norm.weight")
+        return try_cands({"output_norm.weight", "model.norm.weight"});
+    if (hf == "lm_head.weight")
+        return try_cands({"output.weight", "token_embd.weight", "lm_head.weight"});
+    const char* p = "model.layers.";
+    if (hf.rfind(p, 0) == 0) {
+        size_t dot = hf.find('.', strlen(p));
+        std::string L = hf.substr(strlen(p), dot - strlen(p));
+        std::string rest = hf.substr(dot + 1);
+        std::string cand;
+        if (rest == "input_layernorm.weight") cand = "blk." + L + ".attn_norm.weight";
+        else if (rest == "post_attention_layernorm.weight") cand = "blk." + L + ".ffn_norm.weight";
+        else if (rest == "self_attn.q_proj.weight") cand = "blk." + L + ".attn_q.weight";
+        else if (rest == "self_attn.k_proj.weight") cand = "blk." + L + ".attn_k.weight";
+        else if (rest == "self_attn.v_proj.weight") cand = "blk." + L + ".attn_v.weight";
+        else if (rest == "self_attn.o_proj.weight") cand = "blk." + L + ".attn_output.weight";
+        else if (rest == "mlp.gate_proj.weight") cand = "blk." + L + ".ffn_gate.weight";
+        else if (rest == "mlp.up_proj.weight") cand = "blk." + L + ".ffn_up.weight";
+        else if (rest == "mlp.down_proj.weight") cand = "blk." + L + ".ffn_down.weight";
+        if (!cand.empty()) {
+            std::string r = try_cands({cand.c_str(), hf.c_str()});
+            if (!r.empty()) return r;
+        }
+    }
+    return "";
+}
+
 static void load_weight_gguf(const std::string& name, float* dst) {
-    auto it = g_gguf_tmap.find(name);
-    if (it == g_gguf_tmap.end()) { fprintf(stderr, "MISSING GGUF tensor: %s\n", name.c_str()); exit(1); }
+    std::string rn = gguf_resolve_name(name);
+    if (rn.empty()) { fprintf(stderr, "MISSING GGUF tensor: %s\n", name.c_str()); exit(1); }
+    auto it = g_gguf_tmap.find(rn);
     const char* src = g_map + g_gguf_data_start + it->second.offset;
     size_t n = 1; for (auto d : it->second.ne) n *= (size_t)d;
     if (it->second.type == GGML_F32) {
@@ -316,9 +381,11 @@ static void load_weight_gguf(const std::string& name, float* dst) {
         exit(1);
     }
 }
-static void load_bias_gguf(const std::string& name, float* dst, int n) {
-    auto it = g_gguf_tmap.find(name);
-    if (it == g_gguf_tmap.end()) { fprintf(stderr, "MISSING GGUF bias: %s\n", name.c_str()); exit(1); }
+// returns false (and leaves dst untouched) if the bias tensor is absent
+static bool load_bias_gguf(const std::string& name, float* dst, int n) {
+    std::string rn = gguf_resolve_name(name);
+    if (rn.empty()) return false; // no bias in this export
+    auto it = g_gguf_tmap.find(rn);
     const char* src = g_map + g_gguf_data_start + it->second.offset;
     if (it->second.type == GGML_F32) {
         memcpy(dst, src, (size_t)n * 4);
@@ -329,6 +396,7 @@ static void load_bias_gguf(const std::string& name, float* dst, int n) {
         fprintf(stderr, "unsupported bias type %d\n", it->second.type);
         exit(1);
     }
+    return true;
 }
 
 static void load_weight(const std::string& name, float* dst) {
@@ -486,12 +554,12 @@ static void proj(const std::string& wname, const float* X, int M, int K, int N, 
         load_weight_gguf(wname, weight_buf);
         linear(X, M, K, weight_buf, N, Y, nt);
         if (!bname.empty()) {
-            auto& t = g_gguf_tmap[bname];
-            int n = 1; for (auto d : t.ne) n *= (int)d;
-            load_bias_gguf(bname, bias_buf, n);
-            for (int i = 0; i < M; i++)
-                for (int j = 0; j < N; j++)
-                    Y[(size_t)i * N + j] += bias_buf[j];
+            int n = N;
+            if (load_bias_gguf(bname, bias_buf, n)) {
+                for (int i = 0; i < M; i++)
+                    for (int j = 0; j < N; j++)
+                        Y[(size_t)i * N + j] += bias_buf[j];
+            }
         }
     } else {
         WT& w = g_w[wname];
@@ -519,8 +587,9 @@ static void madvise_tensor(const std::string& name, int advice) {
         for (int s : it->second.shape) nbytes *= (size_t)s;
         madvise(g_map + g_data_start + it->second.off, nbytes, advice);
     } else if (g_mode == 2) {
-        auto it = g_gguf_tmap.find(name);
-        if (it == g_gguf_tmap.end()) return;
+        std::string rn = gguf_resolve_name(name);
+        if (rn.empty()) return;
+        auto it = g_gguf_tmap.find(rn);
         size_t nbytes = gguf_tensor_bytes(it->second);
         madvise((void*)(g_map + g_gguf_data_start + it->second.offset), nbytes, advice);
     } else {
@@ -868,7 +937,28 @@ static void rope(float* vec, int n_heads, int pos) {
 // If max_layers < N_LAYERS, this is a draft forward (early exit).
 static void forward_token_(int token, int pos, int nt, int max_layers) {
     // embed
-    if (g_mode == 0) {
+    if (g_mode == 2) {
+        size_t row_off = (size_t)token * g_emb_gguf_row_bytes;
+        const char* row = (const char*)g_emb_gguf + row_off;
+        if (g_emb_gguf_type == GGML_BF16) {
+            const uint16_t* r = (const uint16_t*)row;
+            for (int i = 0; i < HIDDEN; i++) x_buf[i] = bf16_to_f32(r[i]);
+        } else if (g_emb_gguf_type == GGML_F32) {
+            memcpy(x_buf, row, HIDDEN * 4);
+        } else if (g_emb_gguf_type == GGML_Q8_0) {
+            int n_blocks = (HIDDEN + 31) / 32;
+            for (int b = 0; b < n_blocks; b++) {
+                float d = fp16_to_f32(*(const uint16_t*)(row + b * 34));
+                const int8_t* qs = (const int8_t*)(row + b * 34 + 2);
+                int rem = HIDDEN - b * 32;
+                int bn = rem > 32 ? 32 : rem;
+                for (int i = 0; i < bn; i++) x_buf[b * 32 + i] = d * (float)qs[i];
+            }
+        } else if (g_emb_gguf_type == GGML_F16) {
+            const uint16_t* r = (const uint16_t*)row;
+            for (int i = 0; i < HIDDEN; i++) x_buf[i] = fp16_to_f32(r[i]);
+        }
+    } else if (g_mode == 0) {
         const uint16_t* row = g_emb + (size_t)token * HIDDEN;
         for (int i = 0; i < HIDDEN; i++) x_buf[i] = bf16_to_f32(row[i]);
     } else {
@@ -966,7 +1056,54 @@ static void forward_token_(int token, int pos, int nt, int max_layers) {
     #pragma omp parallel for schedule(dynamic) num_threads(nt)
     for (int v0 = 0; v0 < VOCAB; v0 += BLOCK) {
         int b = (v0 + BLOCK > VOCAB) ? (VOCAB - v0) : BLOCK;
-        if (g_mode == 0) {
+        if (g_mode == 2) {
+#if defined(__x86_64__) || defined(__i386__)
+            if (g_emb_gguf_type == GGML_BF16) {
+                for (int j = 0; j < b; j++) {
+                    const uint16_t* r = (const uint16_t*)((const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes);
+                    logits[v0 + j] = dot_xn_bf16_avx2(xn_buf, r, HIDDEN);
+                }
+            } else if (g_emb_gguf_type == GGML_F32) {
+                for (int j = 0; j < b; j++) {
+                    const float* r = (const float*)((const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes);
+                    logits[v0 + j] = dot_xn_f32_avx2(xn_buf, r, HIDDEN);
+                }
+            } else if (g_emb_gguf_type == GGML_Q8_0) {
+                for (int j = 0; j < b; j++) {
+                    const void* r = (const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes;
+                    logits[v0 + j] = dot_xn_q8_avx2(xn_buf, r, HIDDEN);
+                }
+            } else if (g_emb_gguf_type == GGML_F16) {
+                for (int j = 0; j < b; j++) {
+                    const uint16_t* r = (const uint16_t*)((const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes);
+                    logits[v0 + j] = dot_xn_bf16_avx2(xn_buf, r, HIDDEN);
+                }
+            }
+#else
+            for (int j = 0; j < b; j++) {
+                const char* row = (const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes;
+                float s = 0.0f;
+                if (g_emb_gguf_type == GGML_BF16 || g_emb_gguf_type == GGML_F16) {
+                    for (int k = 0; k < HIDDEN; k++) {
+                        uint16_t v = ((const uint16_t*)row)[k];
+                        s += xn_buf[k] * (g_emb_gguf_type == GGML_BF16 ? bf16_to_f32(v) : fp16_to_f32(v));
+                    }
+                } else if (g_emb_gguf_type == GGML_F32) {
+                    for (int k = 0; k < HIDDEN; k++) s += xn_buf[k] * ((const float*)row)[k];
+                } else if (g_emb_gguf_type == GGML_Q8_0) {
+                    int n_blocks = (HIDDEN + 31) / 32;
+                    for (int bi = 0; bi < n_blocks; bi++) {
+                        float d = fp16_to_f32(*(const uint16_t*)(row + bi * 34));
+                        const int8_t* qs = (const int8_t*)(row + bi * 34 + 2);
+                        int rem = HIDDEN - bi * 32;
+                        int bn = rem > 32 ? 32 : rem;
+                        for (int i = 0; i < bn; i++) s += xn_buf[bi * 32 + i] * d * (float)qs[i];
+                    }
+                }
+                logits[v0 + j] = s;
+            }
+#endif
+        } else if (g_mode == 0) {
 #if defined(__x86_64__) || defined(__i386__)
             for (int j = 0; j < b; j++) {
                 const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
@@ -1013,7 +1150,28 @@ static void forward_block(const int* tokens, int M, int pos, int nt) {
     for (int i = 0; i < M; i++) {
         int tok = tokens[i];
         float* xi = x_block + (size_t)i * HIDDEN;
-        if (g_mode == 0) {
+        if (g_mode == 2) {
+            size_t row_off = (size_t)tok * g_emb_gguf_row_bytes;
+            const char* row = (const char*)g_emb_gguf + row_off;
+            if (g_emb_gguf_type == GGML_BF16) {
+                const uint16_t* r = (const uint16_t*)row;
+                for (int j = 0; j < HIDDEN; j++) xi[j] = bf16_to_f32(r[j]);
+            } else if (g_emb_gguf_type == GGML_F32) {
+                memcpy(xi, row, HIDDEN * 4);
+            } else if (g_emb_gguf_type == GGML_Q8_0) {
+                int n_blocks = (HIDDEN + 31) / 32;
+                for (int b = 0; b < n_blocks; b++) {
+                    float d = fp16_to_f32(*(const uint16_t*)(row + b * 34));
+                    const int8_t* qs = (const int8_t*)(row + b * 34 + 2);
+                    int rem = HIDDEN - b * 32;
+                    int bn = rem > 32 ? 32 : rem;
+                    for (int j = 0; j < bn; j++) xi[b * 32 + j] = d * (float)qs[j];
+                }
+            } else if (g_emb_gguf_type == GGML_F16) {
+                const uint16_t* r = (const uint16_t*)row;
+                for (int j = 0; j < HIDDEN; j++) xi[j] = fp16_to_f32(r[j]);
+            }
+        } else if (g_mode == 0) {
             const uint16_t* row = g_emb + (size_t)tok * HIDDEN;
             for (int j = 0; j < HIDDEN; j++) xi[j] = bf16_to_f32(row[j]);
         } else {
@@ -1048,7 +1206,9 @@ static void forward_block(const int* tokens, int M, int pos, int nt) {
         const std::string o_name = "model.layers." + std::to_string(L) + ".self_attn.o_proj.weight";
         float* o_w = nullptr;
         const WT* o_wt = nullptr;
-        if (g_mode == 0) { load_weight(o_name, weight_buf); o_w = weight_buf; }
+        bool o_loaded = false;
+        if (g_mode == 0) { load_weight(o_name, weight_buf); o_w = weight_buf; o_loaded = true; }
+        else if (g_mode == 2) { load_weight_gguf(o_name, weight_buf); o_w = weight_buf; o_loaded = true; }
         else o_wt = &g_w[o_name];
 
         // per-token: RoPE, KV store, attention, O_proj, residual
@@ -1095,7 +1255,7 @@ static void forward_block(const int* tokens, int M, int pos, int nt) {
             }
 
             // O_proj (weights already loaded)
-            if (g_mode == 0) linear(ctx_buf, 1, HIDDEN, o_w, HIDDEN, attn_out, nt);
+            if (g_mode == 0 || g_mode == 2) linear(ctx_buf, 1, HIDDEN, o_w, HIDDEN, attn_out, nt);
             else linear_i8_avx2(ctx_buf, 1, HIDDEN, (const int8_t*)o_wt->data, o_wt->scale, HIDDEN, attn_out, nt);
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -1151,7 +1311,54 @@ static void forward_block(const int* tokens, int M, int pos, int nt) {
     #pragma omp parallel for schedule(dynamic) num_threads(nt)
     for (int v0 = 0; v0 < VOCAB; v0 += BLOCK) {
         int b = (v0 + BLOCK > VOCAB) ? (VOCAB - v0) : BLOCK;
-        if (g_mode == 0) {
+        if (g_mode == 2) {
+#if defined(__x86_64__) || defined(__i386__)
+            if (g_emb_gguf_type == GGML_BF16) {
+                for (int j = 0; j < b; j++) {
+                    const uint16_t* r = (const uint16_t*)((const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes);
+                    logits[v0 + j] = dot_xn_bf16_avx2(xn_buf, r, HIDDEN);
+                }
+            } else if (g_emb_gguf_type == GGML_F32) {
+                for (int j = 0; j < b; j++) {
+                    const float* r = (const float*)((const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes);
+                    logits[v0 + j] = dot_xn_f32_avx2(xn_buf, r, HIDDEN);
+                }
+            } else if (g_emb_gguf_type == GGML_Q8_0) {
+                for (int j = 0; j < b; j++) {
+                    const void* r = (const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes;
+                    logits[v0 + j] = dot_xn_q8_avx2(xn_buf, r, HIDDEN);
+                }
+            } else if (g_emb_gguf_type == GGML_F16) {
+                for (int j = 0; j < b; j++) {
+                    const uint16_t* r = (const uint16_t*)((const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes);
+                    logits[v0 + j] = dot_xn_bf16_avx2(xn_buf, r, HIDDEN);
+                }
+            }
+#else
+            for (int j = 0; j < b; j++) {
+                const char* row = (const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes;
+                float s = 0.0f;
+                if (g_emb_gguf_type == GGML_BF16 || g_emb_gguf_type == GGML_F16) {
+                    for (int k = 0; k < HIDDEN; k++) {
+                        uint16_t v = ((const uint16_t*)row)[k];
+                        s += xn_buf[k] * (g_emb_gguf_type == GGML_BF16 ? bf16_to_f32(v) : fp16_to_f32(v));
+                    }
+                } else if (g_emb_gguf_type == GGML_F32) {
+                    for (int k = 0; k < HIDDEN; k++) s += xn_buf[k] * ((const float*)row)[k];
+                } else if (g_emb_gguf_type == GGML_Q8_0) {
+                    int n_blocks = (HIDDEN + 31) / 32;
+                    for (int bi = 0; bi < n_blocks; bi++) {
+                        float d = fp16_to_f32(*(const uint16_t*)(row + bi * 34));
+                        const int8_t* qs = (const int8_t*)(row + bi * 34 + 2);
+                        int rem = HIDDEN - bi * 32;
+                        int bn = rem > 32 ? 32 : rem;
+                        for (int i = 0; i < bn; i++) s += xn_buf[bi * 32 + i] * d * (float)qs[i];
+                    }
+                }
+                logits[v0 + j] = s;
+            }
+#endif
+        } else if (g_mode == 0) {
 #if defined(__x86_64__) || defined(__i386__)
             for (int j = 0; j < b; j++) {
                 const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
@@ -1204,6 +1411,53 @@ static void lm_head(const float* xn, float* out, int nt) {
                 out[v0 + j] = s;
             }
 #endif
+        } else if (g_mode == 2) {
+#if defined(__x86_64__) || defined(__i386__)
+            if (g_emb_gguf_type == GGML_BF16) {
+                for (int j = 0; j < b; j++) {
+                    const uint16_t* r = (const uint16_t*)((const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes);
+                    out[v0 + j] = dot_xn_bf16_avx2(xn, r, HIDDEN);
+                }
+            } else if (g_emb_gguf_type == GGML_F32) {
+                for (int j = 0; j < b; j++) {
+                    const float* r = (const float*)((const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes);
+                    out[v0 + j] = dot_xn_f32_avx2(xn, r, HIDDEN);
+                }
+            } else if (g_emb_gguf_type == GGML_Q8_0) {
+                for (int j = 0; j < b; j++) {
+                    const void* r = (const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes;
+                    out[v0 + j] = dot_xn_q8_avx2(xn, r, HIDDEN);
+                }
+            } else if (g_emb_gguf_type == GGML_F16) {
+                for (int j = 0; j < b; j++) {
+                    const uint16_t* r = (const uint16_t*)((const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes);
+                    out[v0 + j] = dot_xn_bf16_avx2(xn, r, HIDDEN);
+                }
+            }
+#else
+            for (int j = 0; j < b; j++) {
+                const char* row = (const char*)g_emb_gguf + (size_t)(v0 + j) * g_emb_gguf_row_bytes;
+                float s = 0.0f;
+                if (g_emb_gguf_type == GGML_BF16 || g_emb_gguf_type == GGML_F16) {
+                    for (int k = 0; k < HIDDEN; k++) {
+                        uint16_t v = ((const uint16_t*)row)[k];
+                        s += xn[k] * (g_emb_gguf_type == GGML_BF16 ? bf16_to_f32(v) : fp16_to_f32(v));
+                    }
+                } else if (g_emb_gguf_type == GGML_F32) {
+                    for (int k = 0; k < HIDDEN; k++) s += xn[k] * ((const float*)row)[k];
+                } else if (g_emb_gguf_type == GGML_Q8_0) {
+                    int n_blocks = (HIDDEN + 31) / 32;
+                    for (int bi = 0; bi < n_blocks; bi++) {
+                        float d = fp16_to_f32(*(const uint16_t*)(row + bi * 34));
+                        const int8_t* qs = (const int8_t*)(row + bi * 34 + 2);
+                        int rem = HIDDEN - bi * 32;
+                        int bn = rem > 32 ? 32 : rem;
+                        for (int i = 0; i < bn; i++) s += xn[bi * 32 + i] * d * (float)qs[i];
+                    }
+                }
+                out[v0 + j] = s;
+            }
+#endif
         } else {
 #if defined(__x86_64__) || defined(__i386__)
             for (int j = 0; j < b; j++) {
@@ -1242,13 +1496,17 @@ int main(int argc, char** argv) {
     const char* model_path = "/home/lain/dso/model/model.safetensors";
     const char* env_model = getenv("DSO_MODEL");
     if (env_model) model_path = env_model;
-    g_mode = (strstr(model_path, ".dso") != nullptr) ? 1 : 0;
+    if (strstr(model_path, ".dso") != nullptr) g_mode = 1;
+    else if (strstr(model_path, ".gguf") != nullptr) g_mode = 2;
+    else g_mode = 0;
     g_fd = open(model_path, O_RDONLY);
     if (g_fd < 0) { perror("open model"); return 1; }
     struct stat st; fstat(g_fd, &st); g_map_size = st.st_size;
     g_map = (char*)mmap(nullptr, g_map_size, PROT_READ, MAP_PRIVATE, g_fd, 0);
     if (g_map == MAP_FAILED) { perror("mmap"); return 1; }
-    if (g_mode == 0) parse_header(); else parse_dso();
+    if (g_mode == 0) parse_header();
+    else if (g_mode == 1) parse_dso();
+    else parse_gguf();
 
     // async streaming: prefetch embedding matrix into page-cache, start worker
     madvise_tensor("model.embed_tokens.weight", MADV_WILLNEED);
