@@ -1,35 +1,35 @@
 # DSO Game Engine Core — Specification v0.1
 
-> *Детерминированный событийно-управляемый игровой Runtime.*
+> *A deterministic event-driven game runtime.*
 
 ---
 
-## 1. Концепция
+## 1. Concept
 
-DSO Game Engine Core — это не игровой движок в классическом смысле. Это **Runtime для объектов**, где:
+DSO Game Engine Core is not a game engine in the classical sense. It is an **Object Runtime** where:
 
-- каждый объект по умолчанию спит
-- объект просыпается только по событию
-- объект исполняется локально (нет глобального `Update()`)
-- все знания о мире скомпилированы заранее (графы, контракты, маршруты)
-- рендеринг — независимый потребитель состояния, а не часть логики
+- every object sleeps by default
+- an object wakes only when an event occurs
+- execution is local (no global `Update()`)
+- all world knowledge is compiled ahead of time (graphs, contracts, routes)
+- rendering is an independent consumer of state, not part of game logic
 
-### Сравнение с ECS
+### Comparison with ECS
 
-| | ECS | DSO |
+| Aspect | ECS | DSO |
 |---|---|---|
-| Единица | Entity (int) | Object (int + type + contract) |
-| Логика | System::Update() на каждой entity | Wake → Execute → Sleep |
-| Активность | Всегда все | Только затронутые |
-| Связи | Компоненты (данные) | Контракты + зависимости |
-| Планирование | Runtime (фильтрация запросов) | Compile-time (граф) |
-| Детерминизм | Опционально | Первичен |
+| Unit | Entity (int) | Object (int + type + contract) |
+| Logic | `System::Update()` per entity | `Wake → Execute → Sleep` |
+| Activity | All entities, always | Only affected objects |
+| Relationships | Components (data) | Contracts + dependencies |
+| Planning | Runtime (query filtering) | Compile-time (graph) |
+| Determinism | Optional | Primary |
 
 ---
 
 ## 2. Object Model
 
-### 2.1. Определение объекта
+### 2.1. Object Definition
 
 ```rust
 struct Object {
@@ -44,27 +44,27 @@ struct Object {
 }
 ```
 
-### 2.2. Контракт
+### 2.2. Contract
 
-Контракт — декларация поведения: "что нужно, что даю, на что реагирую".
+A contract is a behavioral declaration: "what I need, what I give, what I react to."
 
 ```rust
 struct Contract {
-    needs: Vec<ResourceSlot>,   // Iron, Wood, ...
-    produces: Vec<ResourceSlot>,// Steel, Damage, ...
-    wakes_on: Vec<EventPattern>,// IronChanged, PowerChanged
+    needs: Vec<ResourceSlot>,     // Iron, Wood, ...
+    produces: Vec<ResourceSlot>,  // Steel, Damage, ...
+    wakes_on: Vec<EventPattern>,  // IronChanged, PowerChanged
 }
 ```
 
-Контракт — первичный источник поведения. Код — только реализация.
+The contract is the primary source of behavior. Code is merely the implementation.
 
-### 2.3. Состояния
+### 2.3. States
 
 ```
   ┌──────────┐
-  │  Sleep   │ ──── событие ────▶ ┌──────────┐
-  └──────────┘                    │  Active  │
-         ▲                        └────┬─────┘
+  │  Sleep   │ ──── event ────▶ ┌──────────┐
+  └──────────┘                   │  Active  │
+         ▲                       └────┬─────┘
          │                             │
          │                             ▼
          │                      ┌──────────────┐
@@ -74,7 +74,7 @@ struct Contract {
          │                   ┌─────────┴──────────┐
          │                   ▼                    ▼
          │            ┌──────────┐        ┌──────────┐
-         │            │  Sleep   │        │ Waiting  │ ──► (ждёт ресурс)
+         │            │  Sleep   │        │ Waiting  │ ──► (awaits resource)
          │            └──────────┘        └──────────┘
          │
     terminate
@@ -89,9 +89,9 @@ struct Contract {
 
 ## 3. Event System
 
-### 3.1. События
+### 3.1. Events
 
-Событие — единственная причина пробуждения. Событие имеет тип, источник, цель, данные.
+An event is the sole reason for waking. Events have a type, source, target, and payload.
 
 ```rust
 struct Event {
@@ -105,30 +105,30 @@ struct Event {
 }
 ```
 
-### 3.2. Распространение
+### 3.2. Propagation
 
-События распространяются по **Event Graph** — скомпилированному графу маршрутов.
+Events propagate through the **Event Graph** — a compiled route map.
 
 ```
-  TreeFelled ──▶ Wood (зависит от Tree)
+  TreeFelled ──▶ Wood (depends on Tree)
                       │
                       ▼
-               Factory (зависит от Wood)
+               Factory (depends on Wood)
                       │
                       ▼
-                Steel (зависит от Factory)
+                Steel (depends on Factory)
 ```
 
-Граф строится на этапе компиляции. Runtime не вычисляет маршруты — только следует им.
+The graph is built at compile time. Runtime does not compute routes — it only follows them.
 
-### 3.3. Очередь событий
+### 3.3. Event Queue
 
-Глобальной очереди нет. Каждый объект имеет inbound-канал. События доставляются по графу напрямую от источника к получателю.
+There is no global queue. Each object has an inbound channel. Events are delivered directly from source to recipient via the graph.
 
 ```
-  Источник ──event──▶ Object A ──event──▶ Object B
-                         │
-                         └──event──▶ Object C
+  Source ──event──▶ Object A ──event──▶ Object B
+                        │
+                        └──event──▶ Object C
 ```
 
 ---
@@ -139,57 +139,57 @@ struct Event {
 
 ```
   [Sleep] ──event──▶ [Active] ──execute──▶ [Sleep]
-                         │                     ▲
-                         ▼                     │
-                    [Verification]──────────────┘
-                         │ (fallback)
-                         ▼
-                     [Error/Recovery]
+                        │                     ▲
+                        ▼                     │
+                   [Verification]──────────────┘
+                        │ (fallback)
+                        ▼
+                    [Error/Recovery]
 ```
 
-1. **Wake** — объект получил событие, проверен контракт (нужные ресурсы есть?)
-2. **Verification** — контракт проверен до исполнения
-3. **Execute** — выполнение действий
-4. **Sleep** — объект засыпает до следующего события
-5. **Error** — если контракт не выполнен, активируется fallback
+1. **Wake** — object received an event, contract is checked (required resources available?)
+2. **Verification** — contract verified before execution
+3. **Execute** — actions are performed
+4. **Sleep** — object sleeps until the next event
+5. **Error** — if the contract is violated, a fallback is activated
 
-### 4.2. Время
+### 4.2. Time
 
-Время — обычное событие. Система не тикает. Если следующий таймер через 5 минут, система делает pause на 5 минут.
+Time is a regular event. The system does not tick. If the next timer is in 5 minutes, the system pauses for 5 minutes.
 
 ```rust
 struct TimerEvent {
     target: ObjectId,
     at: u64,              // timestamp
-    repeat: Option<u64>,  // interval, если периодический
+    repeat: Option<u64>,  // interval, if periodic
 }
 ```
 
-Нет `Update()` — есть `TimerExpired`.
+No `Update()` — only `TimerExpired`.
 
 ---
 
 ## 5. Graph Compilation
 
-### 5.1. Этап сборки
+### 5.1. Build Phase
 
-Перед запуском (на этапе инициализации или загрузки уровня) строится карта графов:
+Before execution (at initialization or level load), the following graphs are built:
 
-1. **Object Graph** — все объекты и их типы
-2. **Dependency Graph** — кто от кого зависит (направленные связи)
-3. **Event Graph** — куда идут события каждого типа
-4. **Resource Graph** — кто владеет какими ресурсами
-5. **Lifetime Graph** — порядок создания и уничтожения
+1. **Object Graph** — all objects and their types
+2. **Dependency Graph** — who depends on whom (directed edges)
+3. **Event Graph** — where events of each type are routed
+4. **Resource Graph** — who owns which resources
+5. **Lifetime Graph** — creation and destruction order
 
-### 5.2. Формат
+### 5.2. Format
 
-Графы компилируются в плоские таблицы для zero-cost runtime-доступа:
+Graphs are compiled into flat tables for zero-cost runtime access:
 
 ```rust
 struct CompiledGraph {
     objects: Vec<CompiledObject>,
     event_routes: Vec<(EventType, ObjectId)>,   // lookup table
-    dependents: Vec<(ObjectId, ObjectId)>,      // кто за кем следит
+    dependents: Vec<(ObjectId, ObjectId)>,      // who watches whom
     resource_owners: Vec<(ResourceId, ObjectId)>,
 }
 ```
@@ -198,9 +198,9 @@ struct CompiledGraph {
 
 ## 6. Resource Management
 
-### 6.1. Владение
+### 6.1. Ownership
 
-Каждый ресурс имеет ровно одного владельца.
+Every resource has exactly one owner.
 
 ```rust
 struct Resource {
@@ -211,35 +211,35 @@ struct Resource {
 }
 ```
 
-### 6.2. Передача
+### 6.2. Transfer
 
-Ресурсы передаются через события или контракты. Никакого скрытого shared state.
+Resources are transferred through events or contracts. No hidden shared state.
 
 ---
 
 ## 7. Presentation
 
-### 7.1. Рендеринг — подписчик
+### 7.1. Rendering Is a Subscriber
 
-Рендерер — независимый объект, который подписан на события изменения состояния.
+The renderer is an independent object subscribed to state change events.
 
 ```
-  GameStateChanged ──▶ Renderer (читает состояние, рисует)
+  GameStateChanged ──▶ Renderer (reads state, draws)
 ```
 
-Рендерер не влияет на симуляцию. Он может работать на любой частоте (30fps, 60fps, 144fps), симуляция от этого не зависит.
+Rendering does not affect simulation. It can run at any frequency (30fps, 60fps, 144fps); the simulation is unaffected.
 
 ### 7.2. View vs Model
 
 ```
-  Object (модель) ──event──▶ View (презентация)
-       │                           │
-       │                    ┌──────┴──────┐
-       │                    │  UI / 3D /  │
-       │                    │  Sound / FX │
-       │                    └─────────────┘
+  Object (model) ──event──▶ View (presentation)
+       │                          │
+       │                   ┌──────┴──────┐
+       │                   │  UI / 3D /  │
+       │                   │  Sound / FX │
+       │                   └─────────────┘
        │
-  (живёт своей жизнью, спит/просыпается)
+  (lives independently, sleeps/wakes)
 ```
 
 ---
@@ -248,28 +248,28 @@ struct Resource {
 
 ### 8.1. Pre-execution
 
-Перед выполнением действия проверяется:
+Before executing an action:
 
-- все ли зависимости удовлетворены?
-- все ли необходимые ресурсы доступны?
-- не нарушает ли действие контракты?
+- are all dependencies satisfied?
+- are all required resources available?
+- does the action violate any contracts?
 
 ### 8.2. Post-execution
 
-После выполнения:
+After execution:
 
-- проверить, что результаты соответствуют контракту
-- если ошибка — активировать Fallback
+- verify results match the contract
+- if error — activate Fallback
 
 ### 8.3. Fallback
 
 ```rust
 enum Fallback {
-    Retry,          // повторить
-    Skip,           // пропустить, продолжить
-    Revert,         // откатить состояние
-    Terminate,      // уничтожить объект
-    PropagateError, // отправить Event::Error подписчикам
+    Retry,          // retry the action
+    Skip,           // skip, continue
+    Revert,         // roll back state
+    Terminate,      // destroy object
+    PropagateError, // send Event::Error to subscribers
 }
 ```
 
@@ -277,18 +277,18 @@ enum Fallback {
 
 ## 9. MVP: Colony Sim Core
 
-### 9.1. Что моделируем
+### 9.1. What We Model
 
-Упрощённый colony simulator (Factorio/RimWorld-lite):
+A simplified colony simulator (Factorio/RimWorld-lite):
 
-- `Tree` — ресурс, восстанавливается со временем
-- `Mine` — добывает руду
-- `Factory` — потребляет ресурсы, производит продукты
-- `Transporter` — перемещает ресурсы между объектами
-- `Player` — ставит цели
-- `City` — потребляет продукты, растёт
+- `Tree` — resource, regenerates over time
+- `Mine` — extracts ore
+- `Factory` — consumes resources, produces goods
+- `Transporter` — moves resources between objects
+- `Player` — sets goals
+- `City` — consumes goods, grows
 
-### 9.2. Объекты и контракты
+### 9.2. Objects and Contracts
 
 ```
   Tree:
@@ -314,15 +314,15 @@ enum Fallback {
     Wake: Timer(30s), ResourceChanged(Steel)
 ```
 
-### 9.3. Поток событий
+### 9.3. Event Flow
 
 ```
-  Timer(10s) ──▶ Tree ──event: WoodProduced──▶ Factory (контракт: Wood)
+  Timer(10s) ──▶ Tree ──event: WoodProduced──▶ Factory (contract: Wood)
                                                    │
                                                    ▼
-                                              (ждёт Iron)
+                                              (awaits Iron)
                                                    │
-  Timer(5s) ──▶ Mine ──event: IronProduced───▶ Factory (контракт: Iron)
+  Timer(5s) ──▶ Mine ──event: IronProduced───▶ Factory (contract: Iron)
                                                    │
                                                    ▼
                                               Produces Steel
@@ -331,40 +331,40 @@ enum Fallback {
                                         event: SteelProduced
                                                    │
                                                    ▼
-                                              City (контракт: Steel)
+                                              City (contract: Steel)
 ```
 
-### 9.4. Метрики MVP
+### 9.4. MVP Metrics
 
-| Метрика | ECS-подход | DSO-подход |
+| Metric | ECS approach | DSO approach |
 |---|---|---|
-| Активных объектов | 100% | ~0.01–1% |
-| CPU на кадр | O(N) | O(k), k = активные |
-| Предиктивность | низкая | высокая |
-| Граф причин | неявный | явный |
+| Active objects | 100% | ~0.01–1% |
+| CPU per frame | O(N) | O(k), k = active count |
+| Predictability | Low | High |
+| Causal graph | Implicit | Explicit |
 
 ---
 
-## 10. Дорожная карта
+## 10. Roadmap
 
-### Phase 0: Rust prototype (текущая)
-- Event loop без глобального `Update()`
-- 3 типа объектов: Tree, Factory, City
-- Контракты через дефинишены
-- Бенчмарк: 1M объектов, все спят, одно событие
+### Phase 0: Rust prototype (current)
+- Event loop without global `Update()`
+- 3 object types: Tree, Factory, City
+- Contracts via definitions
+- Benchmark: 1M objects, all sleeping, single event
 
-### Phase 1: Полнота
-- Все 5 графов (Dependency, Event, Resource, Lifetime, Memory)
-- Verification pre/post-execution
-- Fallback-система
-- Таймеры как события
+### Phase 1: Completeness
+- All 5 graphs (Dependency, Event, Resource, Lifetime, Memory)
+- Pre/post execution verification
+- Fallback system
+- Timer-as-event
 
-### Phase 2: Интеграция
-- DSO-IR экспорт
-- Adapter для Godot / Bevy
-- Инкрементальное сохранение состояния
+### Phase 2: Integration
+- DSO-IR export
+- Adapter for Godot / Bevy
+- Incremental state persistence
 
 ### Phase 3: Distribution
-- Event Graph может跨越 машины
-- Dependency Graph распределённый
-- Deterministic lockstep для multiplayer
+- Event Graph can span machines
+- Dependency Graph distributed
+- Deterministic lockstep for multiplayer

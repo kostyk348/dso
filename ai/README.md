@@ -4,7 +4,7 @@ Zero-malloc LLM inference engine: streaming from disk, INT8 quantization, AVX2 G
 
 See [root README](../README.md) for details.
 
-## Quick start
+## Quick Start
 
 ```bash
 g++ -O3 -fopenmp -std=c++17 dso_runtime.cpp -o dso_runtime

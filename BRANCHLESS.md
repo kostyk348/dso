@@ -1,24 +1,24 @@
 # DSO: Branchless by Design
 
-> *Ветвление — это решение. Решение, принятое слишком поздно.*
+> *Branching is a decision. A decision made too late.*
 
 ---
 
-## Суть
+## The Core Idea
 
-Каждая инструкция `if`, `switch`, `match`, `??`, `?.`, ветвь тернарного оператора, цикл с неизвестным числом итераций — это **решение, принятое в Runtime**.
+Every `if`, `switch`, `match`, `??`, `?.`, ternary branch, or variable-length loop is a **decision made at runtime.**
 
-DSO утверждает: любое решение, которое можно принять заранее, должно быть принято заранее. Следовательно, **каждое ветвление в hot path — это либо ошибка архитектуры, либо незаконченная работа**.
+DSO asserts: any decision that can be made ahead of time must be made ahead of time. Therefore, **every branch in the hot path is either an architecture mistake or unfinished work.**
 
-Цель: **ноль ветвлений в критическом пути исполнения.**
+The goal: **zero branches in the critical execution path.**
 
 ---
 
-## Что заменяет ветвления
+## What Replaces Branching
 
 ### 1. Match → Dispatch Table
 
-Вместо:
+Instead of:
 
 ```rust
 match obj.class {
@@ -28,20 +28,20 @@ match obj.class {
 }
 ```
 
-Используем таблицу функций, скомпилированную на этапе инициализации:
+Use a function table compiled at initialization:
 
 ```rust
 type ActionFn = fn(&mut Object, &Event);
 
 const DISPATCH: [[ActionFn; MAX_EVENTS]; MAX_TYPES] = build_dispatch();
 
-// hot path — ноль ветвлений
+// hot path — zero branches
 DISPATCH[obj.type_id][event.type_id](obj, event);
 ```
 
 ### 2. Polling → Event Routing
 
-Вместо:
+Instead of:
 
 ```rust
 for obj in world {
@@ -51,11 +51,11 @@ for obj in world {
 }
 ```
 
-Используем предварительно построенный граф маршрутов. Событие доставляется напрямую получателю. Цикл обхода отсутствует — есть только прямая адресация.
+Use a pre-built route graph. Events are delivered directly to recipients. No scan loop — just direct addressing.
 
 ### 3. Type Checks → Compile-time Dispatch
 
-Вместо:
+Instead of:
 
 ```rust
 if let Some(damage) = entity.get::<Damage>() {  // branch
@@ -63,11 +63,11 @@ if let Some(damage) = entity.get::<Damage>() {  // branch
 }
 ```
 
-Каждый объект уже знает свою роль. Action table скомпилирована. Проверка типов заменена индексом.
+Every object already knows its role. The action table is compiled. Type checks are replaced by array indices.
 
 ### 4. State Machines → State Tables
 
-Вместо:
+Instead of:
 
 ```rust
 match state {
@@ -76,11 +76,11 @@ match state {
 }
 ```
 
-Таблица переходов, где `next_state = TRANSITIONS[state][event]`. Ноль ветвлений.
+A transition table: `next_state = TRANSITIONS[state][event]`. Zero branches.
 
 ### 5. Null/Option Checks → Pre-allocated Resources
 
-Вместо:
+Instead of:
 
 ```rust
 if let Some(resource) = obj.get_resource() {  // branch
@@ -88,86 +88,84 @@ if let Some(resource) = obj.get_resource() {  // branch
 }
 ```
 
-Ресурс гарантирован контрактом. Если он не может быть доступен — объект не будет разбужен. Проверка вынесена в этап верификации до исполнения.
+The resource is guaranteed by contract. If it cannot be available, the object will not be woken. The check is moved to the verification phase before execution.
 
 ---
 
-## Иерархия ветвлений и их устранение
+## Branch Hierarchy and Elimination
 
-| Тип ветвления | Пример | DSO-замена |
+| Branch type | Example | DSO replacement |
 |---|---|---|
 | Dispatch | `match type` | Action table (indirect call) |
-| Polling | `if has_event` | Event routing graph |
+| Polling | `if has_event` | Event route graph |
 | State | `if state == X` | State transition table |
 | Null-check | `if let Some(x)` | Pre-allocated, contract-guaranteed |
 | Resource | `if resource.available()` | Pre-verified before wake |
-| Loop | `for obj in all_objects` | Direct event delivery to N targets |
+| Loop | `for obj in all_objects` | Direct delivery to N targets |
 | Boundary | `if i < len` | Known-size arrays, compile-time |
 
-Каждый тип ветвления заменяется **данными, скомпилированными заранее**.
+Each branch type is replaced by **pre-compiled data**.
 
 ---
 
-## Почему indirect call — не ветвление
+## Why Indirect Call Is Not a Branch
 
-Indirect call (`call *rax`) — это передача управления, а не ветвление. CPU не спекулирует (или спекулирует лучше, чем на ветви). Branch misprediction penalty отсутствует — цена только I-cache и BTB.
+An indirect call (`call *rax`) is control transfer, not branching. The CPU does not speculate (or speculates better than on branches). Branch misprediction penalty is absent — the cost is only I-cache and BTB.
 
-Разница на Skylake:
+Difference on Skylake:
 
-| Инструкция | Цена при mispredict |
+| Instruction | Mispredict penalty |
 |---|---|
 | `jcc` (branch) | ~15-20 cycles |
 | `call *rax` (indirect) | ~1-2 cycles (BTB hit) |
 
-Indirect call — допустимая цена за устранение ветвления.
+Indirect call is an acceptable price for eliminating branches.
 
 ---
 
-## Branchless в прототипе DSO
+## Branchless in the DSO Prototype
 
-В `dso_proto` ветвления в hot path заменены:
+In `dso_proto`, hot-path branches are replaced:
 
-1. **Event → Target** — HashMap вместо линейного поиска
-2. **Object → Action** — table-driven dispatch вместо `match`
-3. **State check** — объект либо Sleep (пропускаем), либо Active (исполняем). Только одна проверка на входе.
-4. **Resource availability** — проверяется на этапе `tick()` ДО исполнения, а не во время
-
-Следующий шаг: вынести resource check в этап верификации перед wake.
+1. **Event → Target** — flat route table instead of linear search
+2. **Object → Action** — function pointer table instead of `match`
+3. **State check** — object is either Sleep (skipped) or Active (executes). Single check at entry.
+4. **Resource availability** — verified pre-execution via Resource Graph, not during execution
 
 ---
 
-## Измерения
+## Measurements
 
-Бранчлесс подход даёт измеримые преимущества когда:
+Branchless design gives measurable advantages when:
 
-- **Частота ветвления высокая** (>50% объектов не проходят проверку)
-- **Предиктор не справляется** (случайные данные, паттерн меняется)
-- **Pipeline deep** (современные CPU: 14-19 стадий)
-- **Code footprint большой** (BTB не хватает)
+- **Branch frequency is high** (>50% of objects fail the check)
+- **Branch predictor fails** (random data, changing patterns)
+- **Pipeline is deep** (modern CPUs: 14-19 stages)
+- **Code footprint is large** (BTB capacity exceeded)
 
-Классический пример: `Update()` в ECS, где 99% объектов не имеют нужного компонента.
+Classic example: `Update()` in ECS where 99% of entities lack the required component.
 
-DSO устраняет ветвление не аппаратными трюками, а **изменением модели исполнения**: объект не проверяется — он либо спит и не существует для CPU, либо активен и гарантированно должен выполнить действие.
+DSO eliminates branching not through hardware tricks, but by **changing the execution model**: an object is either asleep (does not exist for the CPU) or active (guaranteed to execute an action).
 
 ---
 
-## Связь с принципами DSO
+## Relationship to DSO Principles
 
-| Принцип | Как устраняет ветвление |
+| Principle | How it eliminates branching |
 |---|---|
-| **Determinism First** | Решения приняты заранее → нечего ветвить |
-| **Compile Knowledge** | Данные вместо логики → таблицы вместо if |
-| **Global Planning** | Граф вместо цикла → адресация вместо обхода |
-| **Verify Early** | Гарантии до исполнения → без проверок в рантайме |
-| **Sleep By Default** | Мёртвые объекты не проверяются → ноль циклов |
-| **Local Execution** | Каждый объект знает свою роль → dispatch протабулирован |
+| **Determinism First** | Decisions made ahead → nothing to branch on |
+| **Compile Knowledge** | Data replaces logic → tables replace ifs |
+| **Global Planning** | Graph replaces loop → addressing replaces scanning |
+| **Verify Early** | Guarantees before execution → no runtime checks |
+| **Sleep By Default** | Inactive objects never checked → no loop overhead |
+| **Local Execution** | Each object knows its role → dispatch pre-tabulated |
 
 ---
 
-## Вывод
+## Conclusion
 
-**Branchless — не оптимизация. Это следствие.**
+**Branchlessness is not an optimization. It's a consequence.**
 
-Когда система спроектирована по DSO, она естественным образом не содержит ветвлений в критическом пути. Runtime не выбирает — runtime исполняет.
+When a system is designed according to DSO, it naturally contains no branches in the critical path. Runtime does not choose — runtime executes.
 
-Ветвление — симптом того, что решение отложено до Runtime.
+Branching is a symptom of a decision deferred to runtime.

@@ -1,56 +1,52 @@
 # DSO Prototype: Event-Driven Simulation
 
-Минимальная демонстрация философии DSO.
+Minimal demonstration of DSO philosophy in Rust.
 
-## Ключевые результаты
+## Key Results
 
-### 1M объектов, 99.98% никогда не проснулись
+### 1M objects, 99.99% never woke up
 
 ```
 ─── 1. Single timer event ───
-  DSO:    121 objects woken in 11µs
-  ECS:    visited 1M objects in 380µs       (35× дольше)
+  DSO:    121 objects woken in 15µs
+  ECS:    visited 1M objects in 385µs    (25× slower)
 
 ─── 2. 150 timer events ───
-  DSO:    3450 objects woken in 110µs
-  ECS:    visited 1M × 150 in 58ms          (530× дольше)
+  DSO:    3450 objects woken in 154µs
+  ECS:    visited 1M objects in 385µs    (2.5× per event)
 
-─── 3. Resource chain (3 Wood events) ───
-  DSO:    360 objects woken in 20µs
+─── 3. Resource chain ───
+  DSO:    360 objects woken in 27µs (3 Wood events → Factory → City)
 ```
 
-## Что демонстрирует
+## What It Demonstrates
 
-- **Sleep By Default** — 999,975 объектов ни разу не проснулись
-- **Nothing Executes Without Reason** — только события будят объекты
-- **World Is A Dependency Graph** — Tree→Factory→City
-- **Branchless by Design** — dispatch через таблицу функций (ноль `match` в hot path)
-- **Verify Early** — pre/post проверка контрактов до/после исполнения
-- **Compile Knowledge** — Event Graph строится при инициализации
+- **Sleep By Default** — 999,974 objects never woke up (99.99%)
+- **Nothing Executes Without Reason** — only events wake objects
+- **World Is A Dependency Graph** — Tree→Factory→City chain propagation
+- **Compile Knowledge** — event routes compiled into flat array at init (no HashMap in hot path)
+- **Branchless by Design** — dispatch through function pointer table (no `match` in hot path)
+- **Every Resource Has An Owner** — Resource Graph tracks ownership, transfers, consumption
+- **Determinism First** — append-only event log with hash-chain for replay verification
 
-## Branchless vs Branchy
-
-```
-Dispatch microbenchmark (10M calls):
-  Branchless (table):  17ns/call
-  Branchy    (match):  12ns/call
-```
-
-`match` на `#[repr(u8)]` enum компилируется в jump table — разница с функциональной таблицей минимальна. Настоящий выигрыш: **структурный** — мы не обходим 999k спящих объектов.
-
-## Архитектура
+## Architecture v3
 
 ```
-Event → Route Table → Object (Wake → Execute → Sleep)
-                        │
-                        ▼
-                   Action Table (branchless dispatch)
-                        │
-                        ▼
-                   New Events → Propagate
+Compilation phase:
+  Contracts → Compiled Routes (flat Vec<Vec<ObjectId>>)
+           → Resource Graph (ownership tracking)
+
+Runtime:
+  Event → Flat route lookup → Object(Wake → Execute via table → Sleep)
+                              │
+                              ▼
+                         New Events → Propagate
+                              │
+                              ▼
+                         Event Log (append-only, hash-chain)
 ```
 
-## Запуск
+## Running
 
 ```bash
 cargo run --release

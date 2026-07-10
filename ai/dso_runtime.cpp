@@ -372,7 +372,42 @@ static void request_prefetch(int L) {
 }
 
 // ---- linear: Y[M,N] = X[M,K] @ W^T, W row-major [N,K] ----
+#if defined(__x86_64__) || defined(__i386__)
+static inline float hsum256(__m256 v);
+static inline float hmax256(__m256 v);
+#endif
 static void linear(const float* X, int M, int K, const float* W, int N, float* Y, int nt) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (M == 1) {
+        #pragma omp parallel for schedule(static) num_threads(nt)
+        for (int j = 0; j < N; j++) {
+            const float* wj = W + (size_t)j * K;
+            __m256 acc = _mm256_setzero_ps();
+            for (int k = 0; k < K; k += 8) {
+                __m256 vx = _mm256_loadu_ps(X + k);
+                __m256 vw = _mm256_loadu_ps(wj + k);
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(vx, vw));
+            }
+            Y[j] = hsum256(acc);
+        }
+    } else {
+        #pragma omp parallel for schedule(static) num_threads(nt)
+        for (int i = 0; i < M; i++) {
+            const float* xi = X + (size_t)i * K;
+            float* yi = Y + (size_t)i * N;
+            for (int j = 0; j < N; j++) {
+                const float* wj = W + (size_t)j * K;
+                __m256 acc = _mm256_setzero_ps();
+                for (int k = 0; k < K; k += 8) {
+                    __m256 vx = _mm256_loadu_ps(xi + k);
+                    __m256 vw = _mm256_loadu_ps(wj + k);
+                    acc = _mm256_add_ps(acc, _mm256_mul_ps(vx, vw));
+                }
+                yi[j] = hsum256(acc);
+            }
+        }
+    }
+#else
     if (M == 1) {
         #pragma omp parallel for schedule(static) num_threads(nt)
         for (int j = 0; j < N; j++) {
@@ -382,7 +417,6 @@ static void linear(const float* X, int M, int K, const float* W, int N, float* Y
             Y[j] = s;
         }
     } else {
-        // Row-block partitioning over M (used for prefill with M>1)
         #pragma omp parallel for schedule(static) num_threads(nt)
         for (int i = 0; i < M; i++) {
             const float* xi = X + (size_t)i * K;
@@ -395,6 +429,7 @@ static void linear(const float* X, int M, int K, const float* W, int N, float* Y
             }
         }
     }
+#endif
 }
 
 // ---- branchless AVX2 primitives ----
@@ -560,6 +595,32 @@ static void add_avx2(float* a, const float* b, int n) {
         _mm256_storeu_ps(a + i, _mm256_add_ps(va, vb));
     }
 }
+
+// AVX2 dot product helpers for lm_head (8-wide, no remainder — HIDDEN=896 is multiple of 8)
+__attribute__((target("avx2")))
+static inline float dot_xn_bf16_avx2(const float* xn, const uint16_t* r, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int k = 0; k < n; k += 8) {
+        __m128i bf16 = _mm_loadu_si128((const __m128i*)&r[k]);
+        __m256i i32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16), 16);
+        __m256 vw = _mm256_castsi256_ps(i32);
+        __m256 vx = _mm256_loadu_ps(xn + k);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(vx, vw));
+    }
+    return hsum256(acc);
+}
+
+__attribute__((target("avx2")))
+static inline float dot_xn_i8_avx2(const float* xn, const int8_t* r, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int k = 0; k < n; k += 8) {
+        __m256i vi8 = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)&r[k]));
+        __m256 vf = _mm256_cvtepi32_ps(vi8);
+        __m256 vx = _mm256_loadu_ps(xn + k);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(vx, vf));
+    }
+    return hsum256(acc);
+}
 #endif
 
 static void rope(float* vec, int n_heads, int pos) {
@@ -680,13 +741,26 @@ static void forward_token_(int token, int pos, int nt, int max_layers) {
     for (int v0 = 0; v0 < VOCAB; v0 += BLOCK) {
         int b = (v0 + BLOCK > VOCAB) ? (VOCAB - v0) : BLOCK;
         if (g_mode == 0) {
+#if defined(__x86_64__) || defined(__i386__)
+            for (int j = 0; j < b; j++) {
+                const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
+                logits[v0 + j] = dot_xn_bf16_avx2(xn_buf, r, HIDDEN);
+            }
+#else
             for (int j = 0; j < b; j++) {
                 const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
                 float s = 0.0f;
                 for (int k = 0; k < HIDDEN; k++) s += xn_buf[k] * bf16_to_f32(r[k]);
                 logits[v0 + j] = s;
             }
+#endif
         } else {
+#if defined(__x86_64__) || defined(__i386__)
+            for (int j = 0; j < b; j++) {
+                const int8_t* r = g_emb_i8 + (size_t)(v0 + j) * HIDDEN;
+                logits[v0 + j] = g_emb_scale[v0 + j] * dot_xn_i8_avx2(xn_buf, r, HIDDEN);
+            }
+#else
             for (int j = 0; j < b; j++) {
                 const int8_t* r = g_emb_i8 + (size_t)(v0 + j) * HIDDEN;
                 float sv = g_emb_scale[v0 + j];
@@ -694,6 +768,7 @@ static void forward_token_(int token, int pos, int nt, int max_layers) {
                 for (int k = 0; k < HIDDEN; k++) s += xn_buf[k] * (float)r[k];
                 logits[v0 + j] = sv * s;
             }
+#endif
         }
     }
 }
@@ -851,13 +926,26 @@ static void forward_block(const int* tokens, int M, int pos, int nt) {
     for (int v0 = 0; v0 < VOCAB; v0 += BLOCK) {
         int b = (v0 + BLOCK > VOCAB) ? (VOCAB - v0) : BLOCK;
         if (g_mode == 0) {
+#if defined(__x86_64__) || defined(__i386__)
+            for (int j = 0; j < b; j++) {
+                const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
+                logits[v0 + j] = dot_xn_bf16_avx2(xn_buf, r, HIDDEN);
+            }
+#else
             for (int j = 0; j < b; j++) {
                 const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
                 float s = 0.0f;
                 for (int k = 0; k < HIDDEN; k++) s += xn_buf[k] * bf16_to_f32(r[k]);
                 logits[v0 + j] = s;
             }
+#endif
         } else {
+#if defined(__x86_64__) || defined(__i386__)
+            for (int j = 0; j < b; j++) {
+                const int8_t* r = g_emb_i8 + (size_t)(v0 + j) * HIDDEN;
+                logits[v0 + j] = g_emb_scale[v0 + j] * dot_xn_i8_avx2(xn_buf, r, HIDDEN);
+            }
+#else
             for (int j = 0; j < b; j++) {
                 const int8_t* r = g_emb_i8 + (size_t)(v0 + j) * HIDDEN;
                 float sv = g_emb_scale[v0 + j];
@@ -865,6 +953,7 @@ static void forward_block(const int* tokens, int M, int pos, int nt) {
                 for (int k = 0; k < HIDDEN; k++) s += xn_buf[k] * (float)r[k];
                 logits[v0 + j] = sv * s;
             }
+#endif
         }
     }
 }
@@ -876,13 +965,26 @@ static void lm_head(const float* xn, float* out, int nt) {
     for (int v0 = 0; v0 < VOCAB; v0 += BLOCK) {
         int b = (v0 + BLOCK > VOCAB) ? (VOCAB - v0) : BLOCK;
         if (g_mode == 0) {
+#if defined(__x86_64__) || defined(__i386__)
+            for (int j = 0; j < b; j++) {
+                const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
+                out[v0 + j] = dot_xn_bf16_avx2(xn, r, HIDDEN);
+            }
+#else
             for (int j = 0; j < b; j++) {
                 const uint16_t* r = g_emb + (size_t)(v0 + j) * HIDDEN;
                 float s = 0.0f;
                 for (int k = 0; k < HIDDEN; k++) s += xn[k] * bf16_to_f32(r[k]);
                 out[v0 + j] = s;
             }
+#endif
         } else {
+#if defined(__x86_64__) || defined(__i386__)
+            for (int j = 0; j < b; j++) {
+                const int8_t* r = g_emb_i8 + (size_t)(v0 + j) * HIDDEN;
+                out[v0 + j] = g_emb_scale[v0 + j] * dot_xn_i8_avx2(xn, r, HIDDEN);
+            }
+#else
             for (int j = 0; j < b; j++) {
                 const int8_t* r = g_emb_i8 + (size_t)(v0 + j) * HIDDEN;
                 float sv = g_emb_scale[v0 + j];
@@ -890,6 +992,7 @@ static void lm_head(const float* xn, float* out, int nt) {
                 for (int k = 0; k < HIDDEN; k++) s += xn[k] * (float)r[k];
                 out[v0 + j] = sv * s;
             }
+#endif
         }
     }
 }
@@ -947,11 +1050,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[dso] threads=%d prompt_len=%zu max_new=%d\n", nt, prompt.size(), max_new);
 
     // ---- prefill (process prompt, build KV) ----
-    int pos = 0;
-    for (size_t i = 0; i < prompt.size(); i++) {
-        forward_token(prompt[i], pos, nt);
-        pos++;
-    }
+    forward_block(prompt.data(), (int)prompt.size(), 0, nt);
+    int pos = (int)prompt.size();
     // first generated token from last logits
     int next = argmax(logits, VOCAB);
     std::vector<int> out;
