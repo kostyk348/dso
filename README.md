@@ -30,17 +30,20 @@ dso/
 
 ---
 
-## Prototype Benchmarks
+## Prototype Features
 
-```
-1 event:     DSO   15µs   vs  ECS  385µs   (×25)
-150 events:  DSO  154µs   vs  ECS  385µs   (×2.5 per event, cumulative)
+The Rust prototype (`proto/`) demonstrates 6 DSO principles with real benchmarks:
 
-1,000,000 objects
-    999,974 never woke (99.99%)
-```
+| Feature | Principle | What it shows |
+|---|---|---|
+| Dependency Graph | **World Is A Dep Graph** | 3,100 producer→consumer edges compiled at init, no broadcast |
+| Time as Events | **Time Is Also An Event** | Timed event queue, time skipping to next event |
+| Deterministic Replay | **Determinism First** | 153 timer events replayed, exact match verified |
+| Sleep By Default | **Nothing Executes Without Reason** | 1M objects, 99.98% never touched by CPU |
+| Branchless Dispatch | **Compile Knowledge** | Function pointer table, no `match` in hot path |
+| Resource Graph | **Every Resource Has An Owner** | Ownership tracking, transfer, consumption |
 
-The prototype demonstrates: **Sleep By Default** — objects don't update in a loop, they sleep until an event arrives. The event routing table is compiled ahead of time (flat array, not HashMap in the hot path). Resources are tracked via a Resource Graph with ownership.
+**Key metric:** `cargo run --release` → interactive CLI with `status`, `fire`, `advance`, `replay` commands.
 
 ---
 
