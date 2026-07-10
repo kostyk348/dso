@@ -178,13 +178,33 @@ static void load_weight(const std::string& name, float* dst) {
     if (it == g_tmap.end()) { fprintf(stderr, "MISSING tensor: %s\n", name.c_str()); exit(1); }
     const uint16_t* src = (const uint16_t*)(g_map + g_data_start + it->second.off);
     size_t n = 1; for (int s : it->second.shape) n *= (size_t)s;
+#if defined(__x86_64__) || defined(__i386__)
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i bf16 = _mm_loadu_si128((const __m128i*)&src[i]);
+        __m256i i32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16), 16);
+        _mm256_storeu_ps(&dst[i], _mm256_castsi256_ps(i32));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+#else
     for (size_t i = 0; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+#endif
 }
 static void load_bias(const std::string& name, float* dst, int n) {
     auto it = g_tmap.find(name);
     if (it == g_tmap.end()) { fprintf(stderr, "MISSING bias: %s\n", name.c_str()); exit(1); }
     const uint16_t* src = (const uint16_t*)(g_map + g_data_start + it->second.off);
+#if defined(__x86_64__) || defined(__i386__)
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i bf16 = _mm_loadu_si128((const __m128i*)&src[i]);
+        __m256i i32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16), 16);
+        _mm256_storeu_ps(&dst[i], _mm256_castsi256_ps(i32));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+#else
     for (int i = 0; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+#endif
 }
 
 // ---- parse the INT8 .dso file (header JSON: kind/shape/off/nbytes) ----
