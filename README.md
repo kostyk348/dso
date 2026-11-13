@@ -1,8 +1,17 @@
+<div align="center">
+
+<img src="docs/banner.svg" alt="dso banner" width="1000">
+
 # DSO — Deterministic Streaming Object Runtime
 
 [![Release](https://img.shields.io/github/v/release/kostyk348/dso?sort=semver&color=blue)](https://github.com/kostyk348/dso/releases)
 [![License](https://img.shields.io/badge/license-Apache-2.0-green)](https://github.com/kostyk348/dso/blob/master/LICENSE)
 [![Last commit](https://img.shields.io/github/last-commit/kostyk348/dso?branch=master)](https://github.com/kostyk348/dso/commits/master)
+
+</div>
+
+---
+
 
 > **Any decision that can be made ahead of time must be made ahead of time.**
 > *At runtime, the system must not think — it must execute a pre-verified plan.*
